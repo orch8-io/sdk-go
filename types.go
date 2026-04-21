@@ -166,6 +166,12 @@ type CircuitBreakerState struct {
 	LastFailure  string `json:"last_failure,omitempty"`
 }
 
+// SignalResponse is the 201 body returned by the engine when a signal is
+// enqueued: `{"signal_id": "<uuid>"}`.
+type SignalResponse struct {
+	SignalID string `json:"signal_id"`
+}
+
 // FireTriggerResponse is returned when a trigger is fired.
 type FireTriggerResponse struct {
 	InstanceID   string `json:"instance_id"`

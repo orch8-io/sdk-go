@@ -1,3 +1,4 @@
+// Package orch8 provides a Go client for the Orch8 workflow engine REST API.
 package orch8
 
 import (
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // ClientConfig holds configuration for the Orch8 API client.
@@ -16,6 +18,9 @@ type ClientConfig struct {
 	BaseURL  string
 	TenantID string
 	Headers  map[string]string
+	// HTTPClient allows overriding the default [*http.Client].
+	// If nil, a client with a 30-second timeout is used.
+	HTTPClient *http.Client
 }
 
 // Client is an HTTP client for the Orch8 engine REST API.
@@ -28,11 +33,15 @@ type Client struct {
 
 // NewClient creates a new Orch8 API client.
 func NewClient(cfg ClientConfig) *Client {
+	httpClient := cfg.HTTPClient
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 30 * time.Second}
+	}
 	return &Client{
 		baseURL:  strings.TrimRight(cfg.BaseURL, "/"),
 		tenantID: cfg.TenantID,
 		headers:  cfg.Headers,
-		http:     &http.Client{},
+		http:     httpClient,
 	}
 }
 
@@ -53,6 +62,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any, result a
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "application/json")
 	if c.tenantID != "" {
 		req.Header.Set("X-Tenant-Id", c.tenantID)
 	}
@@ -243,12 +253,6 @@ func (c *Client) UpdateInstanceState(ctx context.Context, id string, body any) e
 // returns 200 with an empty body.
 func (c *Client) UpdateInstanceContext(ctx context.Context, id string, body any) error {
 	return c.do(ctx, http.MethodPatch, "/instances/"+id+"/context", body, nil)
-}
-
-// SignalResponse is the 201 body returned by the engine when a signal is
-// enqueued: `{"signal_id": "<uuid>"}`.
-type SignalResponse struct {
-	SignalID string `json:"signal_id"`
 }
 
 // SendSignal sends a signal to an instance and returns the generated

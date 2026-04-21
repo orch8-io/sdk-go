@@ -2,7 +2,7 @@ package orch8
 
 import (
 	"context"
-	"log"
+	"log/slog"
 	"sync"
 	"time"
 )
@@ -27,6 +27,9 @@ type WorkerConfig struct {
 	OnTaskComplete func(task WorkerTask, output any)
 	// OnTaskFail is called after a task fails.
 	OnTaskFail func(task WorkerTask, err error)
+
+	// Logger is used for worker log output. If nil, slog.Default() is used.
+	Logger *slog.Logger
 }
 
 // maxBackoff is the upper bound for exponential backoff on poll failures.
@@ -44,6 +47,7 @@ type Worker struct {
 	circuitBreakerCheck bool
 	onTaskComplete      func(task WorkerTask, output any)
 	onTaskFail          func(task WorkerTask, err error)
+	logger              *slog.Logger
 
 	cancel   context.CancelFunc
 	sem      chan struct{}
@@ -67,6 +71,10 @@ func NewWorker(cfg WorkerConfig) *Worker {
 	if maxConcurrent <= 0 {
 		maxConcurrent = 10
 	}
+	logger := cfg.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
 
 	return &Worker{
 		client:              cfg.Client,
@@ -78,6 +86,7 @@ func NewWorker(cfg WorkerConfig) *Worker {
 		circuitBreakerCheck: cfg.CircuitBreakerCheck,
 		onTaskComplete:      cfg.OnTaskComplete,
 		onTaskFail:          cfg.OnTaskFail,
+		logger:              logger,
 		sem:                 make(chan struct{}, maxConcurrent),
 		inflight:            make(map[string]struct{}),
 		backoff:             make(map[string]time.Duration),
@@ -86,7 +95,9 @@ func NewWorker(cfg WorkerConfig) *Worker {
 
 // Start begins polling for tasks and blocks until the context is cancelled or Stop is called.
 func (w *Worker) Start(ctx context.Context) {
+	w.mu.Lock()
 	ctx, w.cancel = context.WithCancel(ctx)
+	w.mu.Unlock()
 
 	// Start heartbeat goroutine.
 	w.wg.Add(1)
@@ -114,9 +125,11 @@ func (w *Worker) Start(ctx context.Context) {
 
 // Stop signals the worker to stop polling and waits for in-flight tasks to complete.
 func (w *Worker) Stop() {
+	w.mu.Lock()
 	if w.cancel != nil {
 		w.cancel()
 	}
+	w.mu.Unlock()
 }
 
 func (w *Worker) pollLoop(ctx context.Context, handlerName string) {
@@ -164,7 +177,7 @@ func (w *Worker) poll(ctx context.Context, handlerName string) {
 	tasks, err := w.client.PollTasks(ctx, handlerName, w.workerID, limit)
 	if err != nil {
 		if ctx.Err() == nil {
-			log.Printf("orch8: poll error for handler %s: %v", handlerName, err)
+			w.logger.Error("poll error", "handler", handlerName, "error", err)
 		}
 		// Exponential backoff on failure.
 		w.mu.Lock()
@@ -192,36 +205,36 @@ func (w *Worker) poll(ctx context.Context, handlerName string) {
 
 	for _, task := range tasks {
 		task := task
-		// Acquire semaphore slot.
-		select {
-		case w.sem <- struct{}{}:
-		case <-ctx.Done():
-			return
-		}
-
-		w.mu.Lock()
-		w.inflight[task.ID] = struct{}{}
-		w.mu.Unlock()
-
 		w.wg.Add(1)
 		go func() {
 			defer w.wg.Done()
-			defer func() {
-				<-w.sem
-				w.mu.Lock()
-				delete(w.inflight, task.ID)
-				w.mu.Unlock()
-			}()
 			w.executeTask(ctx, task)
 		}()
 	}
 }
 
 func (w *Worker) executeTask(ctx context.Context, task WorkerTask) {
+	// Acquire semaphore slot.
+	select {
+	case w.sem <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	defer func() {
+		<-w.sem
+		w.mu.Lock()
+		delete(w.inflight, task.ID)
+		w.mu.Unlock()
+	}()
+
+	w.mu.Lock()
+	w.inflight[task.ID] = struct{}{}
+	w.mu.Unlock()
+
 	handler, ok := w.handlers[task.HandlerName]
 	if !ok {
 		if err := w.client.FailTask(ctx, task.ID, w.workerID, "no handler registered for \""+task.HandlerName+"\"", false); err != nil {
-			log.Printf("orch8: failed to report missing handler for task %s: %v", task.ID, err)
+			w.logger.Error("failed to report missing handler", "task", task.ID, "error", err)
 		}
 		return
 	}
@@ -241,7 +254,7 @@ func (w *Worker) executeTask(ctx context.Context, task WorkerTask) {
 		// that need retry-on-error can invoke FailTask directly from the
 		// handler with retryable=true.
 		if failErr := w.client.FailTask(ctx, task.ID, w.workerID, err.Error(), false); failErr != nil {
-			log.Printf("orch8: failed to report failure for task %s: %v", task.ID, failErr)
+			w.logger.Error("failed to report failure", "task", task.ID, "error", failErr)
 		}
 		if w.onTaskFail != nil {
 			w.onTaskFail(task, err)
@@ -253,7 +266,7 @@ func (w *Worker) executeTask(ctx context.Context, task WorkerTask) {
 		output = map[string]any{}
 	}
 	if err := w.client.CompleteTask(ctx, task.ID, w.workerID, output); err != nil {
-		log.Printf("orch8: failed to report completion for task %s: %v", task.ID, err)
+		w.logger.Error("failed to report completion", "task", task.ID, "error", err)
 	}
 	if w.onTaskComplete != nil {
 		w.onTaskComplete(task, output)
@@ -278,7 +291,7 @@ func (w *Worker) heartbeatLoop(ctx context.Context) {
 
 			for _, id := range ids {
 				if err := w.client.HeartbeatTask(ctx, id, w.workerID); err != nil && ctx.Err() == nil {
-					log.Printf("orch8: heartbeat error for task %s: %v", id, err)
+					w.logger.Error("heartbeat error", "task", id, "error", err)
 				}
 			}
 		}
