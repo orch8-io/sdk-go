@@ -1,1 +1,7 @@
 dist/
+
+# Test
+*.test
+*.out
+coverage.txt
+coverage.html
