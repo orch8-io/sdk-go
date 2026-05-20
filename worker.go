@@ -249,11 +249,11 @@ func (w *Worker) executeTask(ctx context.Context, task WorkerTask) {
 
 	output, err := handler(taskCtx, task)
 	if err != nil {
-		// Handler exceptions are non-retryable by default — matches engine
-		// FailRequest default and harmonizes behavior across SDKs. Callers
-		// that need retry-on-error can invoke FailTask directly from the
-		// handler with retryable=true.
-		if failErr := w.client.FailTask(ctx, task.ID, w.workerID, err.Error(), false); failErr != nil {
+		retryable := false
+		if rerr, ok := err.(interface{ Retryable() bool }); ok {
+			retryable = rerr.Retryable()
+		}
+		if failErr := w.client.FailTask(ctx, task.ID, w.workerID, err.Error(), retryable); failErr != nil {
 			w.logger.Error("failed to report failure", "task", task.ID, "error", failErr)
 		}
 		if w.onTaskFail != nil {

@@ -2,6 +2,7 @@
 package orch8
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -684,7 +685,7 @@ func (c *Client) PollTasksFromQueue(ctx context.Context, queue, handlerName, wor
 // ---------------------------------------------------------------------------
 
 // ListApprovals lists instances awaiting approval with optional filters.
-func (c *Client) ListApprovals(ctx context.Context, filter map[string]string) ([]TaskInstance, error) {
+func (c *Client) ListApprovals(ctx context.Context, filter map[string]string) (*ApprovalsResponse, error) {
 	path := "/approvals"
 	if len(filter) > 0 {
 		params := url.Values{}
@@ -693,11 +694,11 @@ func (c *Client) ListApprovals(ctx context.Context, filter map[string]string) ([
 		}
 		path += "?" + params.Encode()
 	}
-	var out []TaskInstance
+	var out ApprovalsResponse
 	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return &out, nil
 }
 
 // ---------------------------------------------------------------------------
@@ -904,4 +905,228 @@ func (c *Client) GetTenantCircuitBreaker(ctx context.Context, tenantID, handler 
 // ResetTenantCircuitBreaker resets a circuit breaker for a specific tenant and handler.
 func (c *Client) ResetTenantCircuitBreaker(ctx context.Context, tenantID, handler string) error {
 	return c.do(ctx, http.MethodPost, "/tenants/"+tenantID+"/circuit-breakers/"+handler+"/reset", nil, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Mobile Sync
+// ---------------------------------------------------------------------------
+
+// MobileSync synchronizes mobile device state with the engine.
+func (c *Client) MobileSync(ctx context.Context, body *SyncRequest) (*SyncResponse, error) {
+	var out SyncResponse
+	if err := c.do(ctx, http.MethodPost, "/mobile/sync", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// RegisterMobileDevice registers a new mobile device.
+func (c *Client) RegisterMobileDevice(ctx context.Context, body *RegisterDeviceRequest) error {
+	return c.do(ctx, http.MethodPost, "/mobile/devices/register", body, nil)
+}
+
+// ListMobileDevices lists all registered mobile devices.
+func (c *Client) ListMobileDevices(ctx context.Context) (*MobileDevicesResponse, error) {
+	var out MobileDevicesResponse
+	if err := c.do(ctx, http.MethodGet, "/mobile/devices", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListMobileApprovals lists approvals accessible from mobile devices.
+func (c *Client) ListMobileApprovals(ctx context.Context) (*MobileApprovalsResponse, error) {
+	var out MobileApprovalsResponse
+	if err := c.do(ctx, http.MethodGet, "/mobile/approvals", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ResolveMobileApproval resolves a mobile approval by ID.
+func (c *Client) ResolveMobileApproval(ctx context.Context, id string, body *ResolveApprovalRequest) error {
+	return c.do(ctx, http.MethodPost, "/mobile/approvals/"+id+"/resolve", body, nil)
+}
+
+// ListMobileStatus lists the mobile status of instances.
+func (c *Client) ListMobileStatus(ctx context.Context) (*MobileStatusResponse, error) {
+	var out MobileStatusResponse
+	if err := c.do(ctx, http.MethodGet, "/mobile/status", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// CreateMobileCommand creates a new command for a mobile device.
+func (c *Client) CreateMobileCommand(ctx context.Context, body *CreateCommandRequest) error {
+	return c.do(ctx, http.MethodPost, "/mobile/commands", body, nil)
+}
+
+// ---------------------------------------------------------------------------
+// Telemetry
+// ---------------------------------------------------------------------------
+
+// IngestTelemetry ingests a batch of telemetry events.
+func (c *Client) IngestTelemetry(ctx context.Context, body *IngestTelemetryRequest) (*IngestResponse, error) {
+	var out IngestResponse
+	if err := c.do(ctx, http.MethodPost, "/telemetry/mobile", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// IngestTelemetryError ingests a single telemetry error.
+func (c *Client) IngestTelemetryError(ctx context.Context, body *IngestErrorRequest) (*IngestResponse, error) {
+	var out IngestResponse
+	if err := c.do(ctx, http.MethodPost, "/telemetry/mobile/errors", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// TelemetryDashboard queries the telemetry dashboard.
+func (c *Client) TelemetryDashboard(ctx context.Context, queryType DashboardQueryType, tenantID, startTime, endTime string) (*DashboardResponse, error) {
+	params := url.Values{"query_type": {string(queryType)}}
+	if tenantID != "" {
+		params.Set("tenant_id", tenantID)
+	}
+	if startTime != "" {
+		params.Set("start_time", startTime)
+	}
+	if endTime != "" {
+		params.Set("end_time", endTime)
+	}
+	var out DashboardResponse
+	if err := c.do(ctx, http.MethodGet, "/telemetry/mobile/dashboard?"+params.Encode(), nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ---------------------------------------------------------------------------
+// Rollback Policies
+// ---------------------------------------------------------------------------
+
+// CreateRollbackPolicy creates a new rollback policy.
+func (c *Client) CreateRollbackPolicy(ctx context.Context, body *CreatePolicyRequest) (*RollbackPolicy, error) {
+	var out RollbackPolicy
+	if err := c.do(ctx, http.MethodPost, "/rollback-policies", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// ListRollbackPolicies lists rollback policies for a tenant.
+func (c *Client) ListRollbackPolicies(ctx context.Context, tenantID string) ([]RollbackPolicy, error) {
+	path := "/rollback-policies"
+	if tenantID != "" {
+		path += "?" + url.Values{"tenant_id": {tenantID}}.Encode()
+	}
+	var out []RollbackPolicy
+	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// GetRollbackPolicy retrieves a rollback policy by name.
+func (c *Client) GetRollbackPolicy(ctx context.Context, name string) (*RollbackPolicy, error) {
+	var out RollbackPolicy
+	if err := c.do(ctx, http.MethodGet, "/rollback-policies/"+name, nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// DeleteRollbackPolicy deletes a rollback policy by name.
+func (c *Client) DeleteRollbackPolicy(ctx context.Context, name string) error {
+	return c.do(ctx, http.MethodDelete, "/rollback-policies/"+name, nil, nil)
+}
+
+// ---------------------------------------------------------------------------
+// SSE Streaming
+// ---------------------------------------------------------------------------
+
+// StreamInstance opens an SSE stream for an instance and returns channels for
+// events and errors. The caller should read from both channels until the error
+// channel is closed. Closing the provided context cancels the stream.
+func (c *Client) StreamInstance(ctx context.Context, instanceID string, pollMs int) (<-chan map[string]any, <-chan error) {
+	eventCh := make(chan map[string]any)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(eventCh)
+		defer close(errCh)
+
+		params := url.Values{}
+		if pollMs > 0 {
+			params.Set("poll_ms", fmt.Sprintf("%d", pollMs))
+		}
+		path := "/instances/" + instanceID + "/stream"
+		if len(params) > 0 {
+			path += "?" + params.Encode()
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path, nil)
+		if err != nil {
+			errCh <- fmt.Errorf("create request: %w", err)
+			return
+		}
+
+		req.Header.Set("Accept", "text/event-stream")
+		if c.tenantID != "" {
+			req.Header.Set("X-Tenant-Id", c.tenantID)
+		}
+		for k, v := range c.headers {
+			req.Header.Set(k, v)
+		}
+
+		resp, err := c.http.Do(req)
+		if err != nil {
+			errCh <- fmt.Errorf("execute request: %w", err)
+			return
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode >= 400 {
+			body, _ := io.ReadAll(resp.Body)
+			errCh <- &Orch8Error{
+				Status: resp.StatusCode,
+				Body:   string(body),
+				Path:   path,
+			}
+			return
+		}
+
+		scanner := bufio.NewScanner(resp.Body)
+		scanner.Buffer(make([]byte, 4096), 1024*1024) // 1MB max line size for large SSE payloads
+		for scanner.Scan() {
+			line := scanner.Text()
+			if !strings.HasPrefix(line, "data: ") {
+				continue
+			}
+			data := strings.TrimPrefix(line, "data: ")
+			if data == "" {
+				continue
+			}
+
+			var event map[string]any
+			if err := json.Unmarshal([]byte(data), &event); err != nil {
+				errCh <- fmt.Errorf("unmarshal SSE event: %w", err)
+				return
+			}
+
+			select {
+			case eventCh <- event:
+			case <-ctx.Done():
+				return
+			}
+		}
+
+		if err := scanner.Err(); err != nil {
+			errCh <- fmt.Errorf("read SSE stream: %w", err)
+		}
+	}()
+
+	return eventCh, errCh
 }

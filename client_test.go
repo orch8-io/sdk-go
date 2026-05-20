@@ -1564,8 +1564,11 @@ func TestInjectBlocks(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestListApprovals(t *testing.T) {
-	srv := newTestServer(t, jsonHandler(t, "GET", "/approvals", 200, []TaskInstance{
-		{ID: "inst-approval-1", State: "waiting_for_approval"},
+	srv := newTestServer(t, jsonHandler(t, "GET", "/approvals", 200, ApprovalsResponse{
+		Items: []ApprovalItem{
+			{InstanceID: "inst-approval-1", Prompt: "Approve this?"},
+		},
+		Total: 1,
 	}))
 
 	c := NewClient(ClientConfig{BaseURL: srv.URL})
@@ -1573,14 +1576,17 @@ func TestListApprovals(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if len(result) != 1 {
-		t.Fatalf("expected 1 instance, got %d", len(result))
+	if len(result.Items) != 1 {
+		t.Fatalf("expected 1 instance, got %d", len(result.Items))
 	}
-	if result[0].ID != "inst-approval-1" {
-		t.Errorf("expected ID inst-approval-1, got %s", result[0].ID)
+	if result.Items[0].InstanceID != "inst-approval-1" {
+		t.Errorf("expected InstanceID inst-approval-1, got %s", result.Items[0].InstanceID)
 	}
-	if result[0].State != "waiting_for_approval" {
-		t.Errorf("expected State waiting_for_approval, got %s", result[0].State)
+	if result.Items[0].Prompt != "Approve this?" {
+		t.Errorf("expected Prompt 'Approve this?', got %s", result.Items[0].Prompt)
+	}
+	if result.Total != 1 {
+		t.Errorf("expected Total 1, got %d", result.Total)
 	}
 }
 
@@ -2000,4 +2006,3 @@ func TestResetTenantCircuitBreaker(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }
-
