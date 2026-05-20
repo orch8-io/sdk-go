@@ -135,6 +135,7 @@ type WorkerTask struct {
 	InstanceID     string `json:"instance_id"`
 	BlockID        string `json:"block_id"`
 	HandlerName    string `json:"handler_name"`
+	QueueName      string `json:"queue_name,omitempty"`
 	Params         any    `json:"params,omitempty"`
 	Context        any    `json:"context,omitempty"`
 	Attempt        int    `json:"attempt"`

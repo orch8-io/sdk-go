@@ -665,13 +665,15 @@ func (c *Client) GetWorkerTaskStats(ctx context.Context) (map[string]any, error)
 }
 
 // PollTasksFromQueue polls for available worker tasks from a specific queue.
-func (c *Client) PollTasksFromQueue(ctx context.Context, queue, workerID string, limit int) ([]WorkerTask, error) {
+func (c *Client) PollTasksFromQueue(ctx context.Context, queue, handlerName, workerID string, limit int) ([]WorkerTask, error) {
 	body := map[string]any{
-		"worker_id": workerID,
-		"limit":     limit,
+		"queue_name":   queue,
+		"handler_name": handlerName,
+		"worker_id":    workerID,
+		"limit":        limit,
 	}
 	var out []WorkerTask
-	if err := c.do(ctx, http.MethodPost, "/workers/tasks/poll/"+queue, body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/workers/tasks/poll/queue", body, &out); err != nil {
 		return nil, err
 	}
 	return out, nil

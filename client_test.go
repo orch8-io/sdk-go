@@ -1633,8 +1633,8 @@ func TestPollTasksFromQueue(t *testing.T) {
 		if r.Method != http.MethodPost {
 			t.Errorf("expected POST, got %s", r.Method)
 		}
-		if r.URL.Path != "/workers/tasks/poll/my-queue" {
-			t.Errorf("expected path /workers/tasks/poll/my-queue, got %s", r.URL.Path)
+		if r.URL.Path != "/workers/tasks/poll/queue" {
+			t.Errorf("expected path /workers/tasks/poll/queue, got %s", r.URL.Path)
 		}
 		json.NewDecoder(r.Body).Decode(&gotBody)
 		w.Header().Set("Content-Type", "application/json")
@@ -1644,7 +1644,7 @@ func TestPollTasksFromQueue(t *testing.T) {
 	})
 
 	c := NewClient(ClientConfig{BaseURL: srv.URL})
-	result, err := c.PollTasksFromQueue(context.Background(), "my-queue", "worker-1", 5)
+	result, err := c.PollTasksFromQueue(context.Background(), "my-queue", "handler-q", "worker-1", 5)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -1653,6 +1653,12 @@ func TestPollTasksFromQueue(t *testing.T) {
 	}
 	if result[0].ID != "task-q1" {
 		t.Errorf("expected ID task-q1, got %s", result[0].ID)
+	}
+	if gotBody["queue_name"] != "my-queue" {
+		t.Errorf("expected queue_name my-queue, got %v", gotBody["queue_name"])
+	}
+	if gotBody["handler_name"] != "handler-q" {
+		t.Errorf("expected handler_name handler-q, got %v", gotBody["handler_name"])
 	}
 	if gotBody["worker_id"] != "worker-1" {
 		t.Errorf("expected worker_id worker-1, got %v", gotBody["worker_id"])
