@@ -1,5 +1,41 @@
 package orch8
 
+// RequestEvent describes an outbound SDK request attempt.
+type RequestEvent struct {
+	Method      string
+	Path        string
+	Attempt     int
+	MaxAttempts int
+}
+
+// ResponseEvent describes the outcome of one outbound request attempt.
+type ResponseEvent struct {
+	RequestEvent
+	DurationMs float64
+	Status     int
+	Err        error
+}
+
+// Page preserves pagination metadata returned by list endpoints.
+type Page[T any] struct {
+	Items      []T    `json:"items"`
+	NextCursor string `json:"next_cursor,omitempty"`
+	Total      *int   `json:"total,omitempty"`
+}
+
+// InstanceStreamOptions controls a resumable instance SSE subscription.
+type InstanceStreamOptions struct {
+	PollMs      int
+	LastEventID string
+}
+
+// SSEEvent preserves the cursor and event type needed to resume a stream.
+type SSEEvent struct {
+	ID    string
+	Event string
+	Data  map[string]any
+}
+
 // SequenceDefinition represents a registered sequence blueprint.
 type SequenceDefinition struct {
 	ID           string `json:"id"`
@@ -10,7 +46,18 @@ type SequenceDefinition struct {
 	Deprecated   bool   `json:"deprecated"`
 	Blocks       []any  `json:"blocks"`
 	Interceptors any    `json:"interceptors,omitempty"`
+	InputSchema  any    `json:"input_schema,omitempty"`
+	SLA          any    `json:"sla,omitempty"`
+	OnFailure    []any  `json:"on_failure,omitempty"`
+	OnCancel     []any  `json:"on_cancel,omitempty"`
+	Status       string `json:"status,omitempty"`
 	CreatedAt    string `json:"created_at"`
+}
+
+// CreateSequenceResponse is returned after a sequence definition is accepted.
+type CreateSequenceResponse struct {
+	ID       string   `json:"id"`
+	Warnings []string `json:"warnings,omitempty"`
 }
 
 // TaskInstance represents a running or completed instance of a sequence.
@@ -131,24 +178,31 @@ type Session struct {
 
 // WorkerTask represents a task assigned to an external worker.
 type WorkerTask struct {
-	ID             string `json:"id"`
-	InstanceID     string `json:"instance_id"`
-	BlockID        string `json:"block_id"`
-	HandlerName    string `json:"handler_name"`
-	QueueName      string `json:"queue_name,omitempty"`
-	Params         any    `json:"params,omitempty"`
-	Context        any    `json:"context,omitempty"`
-	Attempt        int    `json:"attempt"`
-	TimeoutMs      *int   `json:"timeout_ms,omitempty"`
-	State          string `json:"state"`
-	WorkerID       string `json:"worker_id,omitempty"`
-	ClaimedAt      string `json:"claimed_at,omitempty"`
-	HeartbeatAt    string `json:"heartbeat_at,omitempty"`
-	CompletedAt    string `json:"completed_at,omitempty"`
-	Output         any    `json:"output,omitempty"`
-	ErrorMessage   string `json:"error_message,omitempty"`
-	ErrorRetryable *bool  `json:"error_retryable,omitempty"`
-	CreatedAt      string `json:"created_at"`
+	ID               string `json:"id"`
+	InstanceID       string `json:"instance_id"`
+	BlockID          string `json:"block_id"`
+	HandlerName      string `json:"handler_name"`
+	QueueName        string `json:"queue_name,omitempty"`
+	Params           any    `json:"params,omitempty"`
+	Context          any    `json:"context,omitempty"`
+	Attempt          int    `json:"attempt"`
+	TimeoutMs        *int   `json:"timeout_ms,omitempty"`
+	State            string `json:"state"`
+	WorkerID         string `json:"worker_id,omitempty"`
+	ClaimedAt        string `json:"claimed_at,omitempty"`
+	HeartbeatAt      string `json:"heartbeat_at,omitempty"`
+	CompletedAt      string `json:"completed_at,omitempty"`
+	Output           any    `json:"output,omitempty"`
+	ErrorMessage     string `json:"error_message,omitempty"`
+	ErrorRetryable   *bool  `json:"error_retryable,omitempty"`
+	ResumeCheckpoint any    `json:"resume_checkpoint,omitempty"`
+	CheckpointSeq    uint64 `json:"checkpoint_seq"`
+	CreatedAt        string `json:"created_at"`
+}
+
+// HeartbeatResponse reports the current checkpoint sequence after a heartbeat.
+type HeartbeatResponse struct {
+	CheckpointSeq uint64 `json:"checkpoint_seq"`
 }
 
 // ClusterNode represents a node in the engine cluster.
@@ -483,25 +537,27 @@ type ApprovalsResponse struct {
 
 // CreateInstanceRequest is the typed request body for creating an instance.
 type CreateInstanceRequest struct {
-	SequenceID       string `json:"sequence_id"`
-	TenantID         string `json:"tenant_id,omitempty"`
-	Namespace        string `json:"namespace,omitempty"`
-	Priority         int    `json:"priority,omitempty"`
-	Timezone         string `json:"timezone,omitempty"`
-	Metadata         any    `json:"metadata,omitempty"`
-	Context          any    `json:"context,omitempty"`
-	ConcurrencyKey   string `json:"concurrency_key,omitempty"`
-	MaxConcurrency   *int   `json:"max_concurrency,omitempty"`
-	IdempotencyKey   string `json:"idempotency_key,omitempty"`
-	SessionID        string `json:"session_id,omitempty"`
-	ParentInstanceID string `json:"parent_instance_id,omitempty"`
-	NextFireAt       string `json:"next_fire_at,omitempty"`
+	SequenceID        string `json:"sequence_id"`
+	TenantID          string `json:"tenant_id,omitempty"`
+	Namespace         string `json:"namespace,omitempty"`
+	Priority          int    `json:"priority,omitempty"`
+	Timezone          string `json:"timezone,omitempty"`
+	Metadata          any    `json:"metadata,omitempty"`
+	Context           any    `json:"context,omitempty"`
+	ConcurrencyKey    string `json:"concurrency_key,omitempty"`
+	MaxConcurrency    *int   `json:"max_concurrency,omitempty"`
+	IdempotencyKey    string `json:"idempotency_key,omitempty"`
+	SessionID         string `json:"session_id,omitempty"`
+	ParentInstanceID  string `json:"parent_instance_id,omitempty"`
+	NextFireAt        string `json:"next_fire_at,omitempty"`
+	DryRun            bool   `json:"dry_run,omitempty"`
+	DryRunAutoApprove bool   `json:"dry_run_auto_approve,omitempty"`
 }
 
 // UpdateStateRequest is the typed request body for updating instance state.
 type UpdateStateRequest struct {
-	State       string `json:"state"`
-	NextFireAt  string `json:"next_fire_at,omitempty"`
+	State      string `json:"state"`
+	NextFireAt string `json:"next_fire_at,omitempty"`
 }
 
 // UpdateContextRequest is the typed request body for updating instance context.

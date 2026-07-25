@@ -6,7 +6,221 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
+
+func TestRequestSupportsNewEngineRoutes(t *testing.T) {
+	var got map[string]string
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/continuity/handoffs" || r.Method != http.MethodPost {
+			t.Fatalf("unexpected request %s %s", r.Method, r.URL.Path)
+		}
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"id": "handoff-1"})
+	})
+
+	c := NewClient(ClientConfig{BaseURL: srv.URL})
+	var result map[string]string
+	if err := c.Request(context.Background(), http.MethodPost, "/continuity/handoffs", map[string]string{"execution_id": "exec-1"}, &result); err != nil {
+		t.Fatal(err)
+	}
+	if got["execution_id"] != "exec-1" || result["id"] != "handoff-1" {
+		t.Fatalf("unexpected request/response: got=%v result=%v", got, result)
+	}
+}
+
+func TestRequestRejectsProtocolRelativePath(t *testing.T) {
+	c := NewClient(ClientConfig{BaseURL: "http://example.test"})
+	err := c.Request(context.Background(), http.MethodGet, "//untrusted.test/path", nil, nil)
+	if err == nil {
+		t.Fatal("expected invalid path error")
+	}
+}
+
+func TestSafeRequestsRetryTransientFailures(t *testing.T) {
+	attempts := 0
+	retries := []int{}
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"id": "seq-1"})
+	})
+	c := NewClient(ClientConfig{
+		BaseURL:        srv.URL,
+		RetryBaseDelay: time.Nanosecond,
+		OnRetry:        func(_ error, attempt int) { retries = append(retries, attempt) },
+	})
+
+	if _, err := c.GetSequence(context.Background(), "seq-1"); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 3 || len(retries) != 2 || retries[0] != 2 || retries[1] != 3 {
+		t.Fatalf("unexpected attempts/retries: %d %v", attempts, retries)
+	}
+}
+
+func TestDynamicHeadersRefreshBeforeRetry(t *testing.T) {
+	attempts := 0
+	tokens := []string{"old", "fresh"}
+	seen := []string{}
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Authorization"))
+		attempts++
+		if attempts == 1 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"id": "seq-1"})
+	})
+	index := 0
+	c := NewClient(ClientConfig{
+		BaseURL:        srv.URL,
+		RetryBaseDelay: time.Nanosecond,
+		GetHeaders: func(context.Context) (map[string]string, error) {
+			token := tokens[index]
+			index++
+			return map[string]string{"Authorization": "Bearer " + token}, nil
+		},
+	})
+
+	if _, err := c.GetSequence(context.Background(), "seq-1"); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 || seen[0] != "Bearer old" || seen[1] != "Bearer fresh" {
+		t.Fatalf("unexpected authorization headers: %v", seen)
+	}
+}
+
+func TestUnsafeRequestsAreNotRetried(t *testing.T) {
+	attempts := 0
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusServiceUnavailable)
+	})
+	c := NewClient(ClientConfig{BaseURL: srv.URL, TenantID: "t-1", RetryBaseDelay: time.Nanosecond})
+
+	if _, err := c.CreateInstance(context.Background(), map[string]any{"sequence_id": "seq-1"}); err == nil {
+		t.Fatal("expected error")
+	}
+	if attempts != 1 {
+		t.Fatalf("unsafe request retried %d times", attempts)
+	}
+}
+
+func TestObserversAndPageMetadata(t *testing.T) {
+	requests := []RequestEvent{}
+	responses := []ResponseEvent{}
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"items":       []map[string]string{{"id": "i1"}},
+			"next_cursor": "next",
+			"total":       4,
+		})
+	})
+	c := NewClient(ClientConfig{
+		BaseURL:    srv.URL,
+		OnRequest:  func(event RequestEvent) { requests = append(requests, event) },
+		OnResponse: func(event ResponseEvent) { responses = append(responses, event) },
+	})
+
+	page, err := RequestPage[map[string]string](context.Background(), c, "/instances", map[string]string{"limit": "1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page.Items) != 1 || page.NextCursor != "next" || page.Total == nil || *page.Total != 4 {
+		t.Fatalf("unexpected page: %+v", page)
+	}
+	if len(requests) != 1 || len(responses) != 1 || responses[0].Status != http.StatusOK {
+		t.Fatalf("unexpected observations: requests=%v responses=%v", requests, responses)
+	}
+}
+
+func TestResourceIDsAreEncodedAsPathSegments(t *testing.T) {
+	var escapedPath string
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		escapedPath = r.URL.EscapedPath()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"id": "folder/seq"})
+	})
+	c := NewClient(ClientConfig{BaseURL: srv.URL})
+
+	if _, err := c.GetSequence(context.Background(), "folder/seq"); err != nil {
+		t.Fatal(err)
+	}
+	if escapedPath != "/sequences/folder%2Fseq" {
+		t.Fatalf("unexpected escaped path: %s", escapedPath)
+	}
+}
+
+func TestResumableStreamExposesCursor(t *testing.T) {
+	var lastEventID, escapedPath, pollMs string
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		lastEventID = r.Header.Get("Last-Event-ID")
+		escapedPath = r.URL.EscapedPath()
+		pollMs = r.URL.Query().Get("poll_ms")
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Write([]byte("id: cursor-2\nevent: state\ndata: {\"state\":\"running\"}\n\n"))
+	})
+	c := NewClient(ClientConfig{BaseURL: srv.URL})
+	events, errors := c.StreamInstanceEvents(context.Background(), "folder/inst", InstanceStreamOptions{
+		PollMs: 10, LastEventID: "cursor-1",
+	})
+	event := <-events
+	for err := range errors {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if event.ID != "cursor-2" || event.Event != "state" || event.Data["state"] != "running" {
+		t.Fatalf("unexpected event: %+v", event)
+	}
+	if lastEventID != "cursor-1" || escapedPath != "/instances/folder%2Finst/stream" || pollMs != "100" {
+		t.Fatalf("unexpected request: cursor=%q path=%q poll_ms=%q", lastEventID, escapedPath, pollMs)
+	}
+}
+
+func TestHeartbeatTaskWithCheckpoint(t *testing.T) {
+	var got map[string]any
+	srv := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Fatal(err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]int{"checkpoint_seq": 8})
+	})
+
+	c := NewClient(ClientConfig{BaseURL: srv.URL})
+	seq := uint64(7)
+	result, err := c.HeartbeatTaskWithCheckpoint(
+		context.Background(), "task-1", "worker-1", map[string]int{"cursor": 4}, &seq,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.CheckpointSeq != 8 || got["checkpoint_seq"] != float64(7) {
+		t.Fatalf("unexpected request/response: got=%v result=%+v", got, result)
+	}
+}
+
+func TestHeartbeatTaskWithCheckpointRequiresSequence(t *testing.T) {
+	c := NewClient(ClientConfig{BaseURL: "http://example.test"})
+	_, err := c.HeartbeatTaskWithCheckpoint(
+		context.Background(), "task-1", "worker-1", map[string]int{"cursor": 4}, nil,
+	)
+	if err == nil {
+		t.Fatal("expected checkpoint sequence validation error")
+	}
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -159,14 +373,11 @@ func TestCreateSequence(t *testing.T) {
 		gotPath = r.URL.Path
 		json.NewDecoder(r.Body).Decode(&gotBody)
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(SequenceDefinition{
-			ID:   "seq-1",
-			Name: "test-seq",
-		})
+		json.NewEncoder(w).Encode(CreateSequenceResponse{ID: "seq-1"})
 	}))
 	defer srv.Close()
 
-	c := NewClient(ClientConfig{BaseURL: srv.URL})
+	c := NewClient(ClientConfig{BaseURL: srv.URL, TenantID: "tenant-1"})
 	body := map[string]any{"name": "test-seq", "blocks": []any{}}
 	resp, err := c.CreateSequence(context.Background(), body)
 	if err != nil {
@@ -180,6 +391,11 @@ func TestCreateSequence(t *testing.T) {
 	}
 	if resp.ID != "seq-1" {
 		t.Errorf("expected ID seq-1, got %s", resp.ID)
+	}
+	for _, field := range []string{"id", "tenant_id", "namespace", "version", "status", "created_at"} {
+		if gotBody[field] == nil || gotBody[field] == "" {
+			t.Errorf("expected normalized %s, got body %v", field, gotBody)
+		}
 	}
 	if gotBody["name"] != "test-seq" {
 		t.Errorf("expected body name test-seq, got %v", gotBody["name"])
@@ -330,7 +546,7 @@ func TestCreateInstance(t *testing.T) {
 		json.NewEncoder(w).Encode(TaskInstance{ID: "inst-1", State: "pending"})
 	})
 
-	c := NewClient(ClientConfig{BaseURL: srv.URL})
+	c := NewClient(ClientConfig{BaseURL: srv.URL, TenantID: "tenant-1"})
 	resp, err := c.CreateInstance(context.Background(), map[string]any{"sequence_id": "seq-1"})
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -396,10 +612,10 @@ func TestListInstances(t *testing.T) {
 			t.Errorf("expected path /instances, got %s", r.URL.Path)
 		}
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode([]TaskInstance{
+		json.NewEncoder(w).Encode(map[string]any{"items": []TaskInstance{
 			{ID: "inst-1"},
 			{ID: "inst-2"},
-		})
+		}, "has_more": false})
 	})
 
 	c := NewClient(ClientConfig{BaseURL: srv.URL})
@@ -1477,10 +1693,10 @@ func TestResetCircuitBreaker(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestListSequences(t *testing.T) {
-	srv := newTestServer(t, jsonHandler(t, "GET", "/sequences", 200, []SequenceDefinition{
+	srv := newTestServer(t, jsonHandler(t, "GET", "/sequences", 200, map[string]any{"items": []SequenceDefinition{
 		{ID: "seq-1", Name: "alpha"},
 		{ID: "seq-2", Name: "beta"},
-	}))
+	}, "has_more": false}))
 
 	c := NewClient(ClientConfig{BaseURL: srv.URL})
 	result, err := c.ListSequences(context.Background(), nil)

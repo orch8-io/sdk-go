@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -22,14 +23,36 @@ type ClientConfig struct {
 	// HTTPClient allows overriding the default [*http.Client].
 	// If nil, a client with a 30-second timeout is used.
 	HTTPClient *http.Client
+	// GetHeaders resolves short-lived auth headers before every attempt.
+	GetHeaders func(context.Context) (map[string]string, error)
+	// RetryMaxAttempts is the total number of safe-request attempts. Zero uses 3.
+	// Set it to 1 to disable retries.
+	RetryMaxAttempts int
+	// RetryBaseDelay is the initial exponential-backoff delay. Zero uses 250ms.
+	RetryBaseDelay time.Duration
+	// OnRetry is called before a retry; attempt is the one-based next attempt.
+	OnRetry func(error, int)
+	// OnRequest and OnResponse observe attempts without changing request behavior.
+	OnRequest  func(RequestEvent)
+	OnResponse func(ResponseEvent)
 }
 
 // Client is an HTTP client for the Orch8 engine REST API.
 type Client struct {
-	baseURL  string
-	tenantID string
-	headers  map[string]string
-	http     *http.Client
+	baseURL          string
+	tenantID         string
+	headers          map[string]string
+	http             *http.Client
+	getHeaders       func(context.Context) (map[string]string, error)
+	retryMaxAttempts int
+	retryBaseDelay   time.Duration
+	onRetry          func(error, int)
+	onRequest        func(RequestEvent)
+	onResponse       func(ResponseEvent)
+}
+
+func pathSegment(value string) string {
+	return url.PathEscape(value)
 }
 
 // NewClient creates a new Orch8 API client.
@@ -38,28 +61,120 @@ func NewClient(cfg ClientConfig) *Client {
 	if httpClient == nil {
 		httpClient = &http.Client{Timeout: 30 * time.Second}
 	}
+	retryMaxAttempts := cfg.RetryMaxAttempts
+	if retryMaxAttempts == 0 {
+		retryMaxAttempts = 3
+	}
+	retryBaseDelay := cfg.RetryBaseDelay
+	if retryBaseDelay == 0 {
+		retryBaseDelay = 250 * time.Millisecond
+	}
 	return &Client{
-		baseURL:  strings.TrimRight(cfg.BaseURL, "/"),
-		tenantID: cfg.TenantID,
-		headers:  cfg.Headers,
-		http:     httpClient,
+		baseURL:          strings.TrimRight(cfg.BaseURL, "/"),
+		tenantID:         cfg.TenantID,
+		headers:          cfg.Headers,
+		http:             httpClient,
+		getHeaders:       cfg.GetHeaders,
+		retryMaxAttempts: retryMaxAttempts,
+		retryBaseDelay:   retryBaseDelay,
+		onRetry:          cfg.OnRetry,
+		onRequest:        cfg.OnRequest,
+		onResponse:       cfg.OnResponse,
 	}
 }
 
 // do performs an HTTP request and decodes the response.
 func (c *Client) do(ctx context.Context, method, path string, body any, result any) error {
-	var bodyReader io.Reader
+	var bodyData []byte
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
 			return fmt.Errorf("marshal request body: %w", err)
 		}
-		bodyReader = bytes.NewReader(data)
+		bodyData = data
+	}
+
+	maxAttempts := 1
+	if method == http.MethodGet || method == http.MethodHead {
+		maxAttempts = c.retryMaxAttempts
+		if maxAttempts < 1 {
+			maxAttempts = 1
+		}
+	}
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		event := RequestEvent{Method: method, Path: path, Attempt: attempt, MaxAttempts: maxAttempts}
+		startedAt := time.Now()
+		c.observeRequest(event)
+		status, err := c.doOnce(ctx, method, path, bodyData, result)
+		c.observeResponse(ResponseEvent{
+			RequestEvent: event,
+			DurationMs:   float64(time.Since(startedAt).Microseconds()) / 1000,
+			Status:       status,
+			Err:          err,
+		})
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		if attempt >= maxAttempts || !isRetryableError(err) {
+			return err
+		}
+		if c.onRetry != nil {
+			c.onRetry(err, attempt+1)
+		}
+		delay := c.retryBaseDelay * time.Duration(1<<(attempt-1))
+		if delay > 0 {
+			timer := time.NewTimer(delay)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return lastErr
+}
+
+func (c *Client) observeRequest(event RequestEvent) {
+	defer func() { _ = recover() }()
+	if c.onRequest != nil {
+		c.onRequest(event)
+	}
+}
+
+func (c *Client) observeResponse(event ResponseEvent) {
+	defer func() { _ = recover() }()
+	if c.onResponse != nil {
+		c.onResponse(event)
+	}
+}
+
+type transportError struct{ err error }
+
+func (e *transportError) Error() string { return fmt.Sprintf("execute request: %v", e.err) }
+func (e *transportError) Unwrap() error { return e.err }
+
+func isRetryableError(err error) bool {
+	if _, ok := err.(*transportError); ok {
+		return true
+	}
+	if apiErr, ok := err.(*Orch8Error); ok {
+		return apiErr.Status == 408 || apiErr.Status == 425 || apiErr.Status == 429 || apiErr.Status >= 500
+	}
+	return false
+}
+
+func (c *Client) doOnce(ctx context.Context, method, path string, bodyData []byte, result any) (int, error) {
+	var bodyReader io.Reader
+	if bodyData != nil {
+		bodyReader = bytes.NewReader(bodyData)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, bodyReader)
 	if err != nil {
-		return fmt.Errorf("create request: %w", err)
+		return 0, fmt.Errorf("create request: %w", err)
 	}
 
 	req.Header.Set("Content-Type", "application/json")
@@ -70,20 +185,29 @@ func (c *Client) do(ctx context.Context, method, path string, body any, result a
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
+	if c.getHeaders != nil {
+		dynamicHeaders, err := c.getHeaders(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("resolve request headers: %w", err)
+		}
+		for k, v := range dynamicHeaders {
+			req.Header.Set(k, v)
+		}
+	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("execute request: %w", err)
+		return 0, &transportError{err: err}
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("read response body: %w", err)
+		return resp.StatusCode, fmt.Errorf("read response body: %w", err)
 	}
 
 	if resp.StatusCode >= 400 {
-		return &Orch8Error{
+		return resp.StatusCode, &Orch8Error{
 			Status: resp.StatusCode,
 			Body:   string(respBody),
 			Path:   path,
@@ -91,20 +215,61 @@ func (c *Client) do(ctx context.Context, method, path string, body any, result a
 	}
 
 	if resp.StatusCode == 204 || result == nil {
-		return nil
+		return resp.StatusCode, nil
 	}
 
 	// Engine returns 200 with an empty body for several handlers
 	// (update_state, update_context, etc.). Treat that as a successful
 	// no-content response instead of surfacing "unexpected end of JSON input".
 	if len(respBody) == 0 {
-		return nil
+		return resp.StatusCode, nil
 	}
 
 	if err := json.Unmarshal(respBody, result); err != nil {
-		return fmt.Errorf("unmarshal response: %w", err)
+		return resp.StatusCode, fmt.Errorf("unmarshal response: %w", err)
 	}
-	return nil
+	return resp.StatusCode, nil
+}
+
+// RequestPage calls a list endpoint while preserving pagination metadata.
+func RequestPage[T any](ctx context.Context, client *Client, path string, filter map[string]string) (*Page[T], error) {
+	if len(filter) > 0 {
+		params := url.Values{}
+		for key, value := range filter {
+			params.Set(key, value)
+		}
+		separator := "?"
+		if strings.Contains(path, "?") {
+			separator = "&"
+		}
+		path += separator + params.Encode()
+	}
+	var raw json.RawMessage
+	if err := client.Request(ctx, http.MethodGet, path, nil, &raw); err != nil {
+		return nil, err
+	}
+	if len(raw) > 0 && raw[0] == '[' {
+		var items []T
+		if err := json.Unmarshal(raw, &items); err != nil {
+			return nil, fmt.Errorf("unmarshal page items: %w", err)
+		}
+		return &Page[T]{Items: items}, nil
+	}
+	var page Page[T]
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return nil, fmt.Errorf("unmarshal page: %w", err)
+	}
+	return &page, nil
+}
+
+// Request calls an engine endpoint not yet covered by a convenience method.
+// Path must be relative to the configured engine origin. This provides forward
+// compatibility for newly introduced and experimental API routes.
+func (c *Client) Request(ctx context.Context, method, path string, body any, result any) error {
+	if !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") {
+		return fmt.Errorf("path must start with exactly one '/' character")
+	}
+	return c.do(ctx, method, path, body, result)
 }
 
 // ---------------------------------------------------------------------------
@@ -112,18 +277,88 @@ func (c *Client) do(ctx context.Context, method, path string, body any, result a
 // ---------------------------------------------------------------------------
 
 // CreateSequence registers a new sequence definition.
-func (c *Client) CreateSequence(ctx context.Context, body any) (*SequenceDefinition, error) {
-	var out SequenceDefinition
-	if err := c.do(ctx, http.MethodPost, "/sequences", body, &out); err != nil {
+func (c *Client) CreateSequence(ctx context.Context, body any) (*CreateSequenceResponse, error) {
+	prepared, err := c.prepareTenantNamespace(body)
+	if err != nil {
+		return nil, fmt.Errorf("create sequence: %w", err)
+	}
+	if prepared["id"] == nil || prepared["id"] == "" {
+		id, err := newUUID()
+		if err != nil {
+			return nil, err
+		}
+		prepared["id"] = id
+	}
+	setDefault(prepared, "version", 1)
+	setDefault(prepared, "deprecated", false)
+	setDefault(prepared, "status", "production")
+	setDefault(prepared, "created_at", time.Now().UTC().Format(time.RFC3339Nano))
+
+	var out CreateSequenceResponse
+	if err := c.do(ctx, http.MethodPost, "/sequences", prepared, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
 }
 
+func setDefault(values map[string]any, key string, value any) {
+	if current, exists := values[key]; !exists || current == nil || current == "" {
+		values[key] = value
+	}
+}
+
+func newUUID() (string, error) {
+	var value [16]byte
+	if _, err := rand.Read(value[:]); err != nil {
+		return "", fmt.Errorf("generate sequence id: %w", err)
+	}
+	value[6] = (value[6] & 0x0f) | 0x40
+	value[8] = (value[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%x-%x-%x-%x-%x", value[:4], value[4:6], value[6:8], value[8:10], value[10:]), nil
+}
+
+func decodeList[T any](raw json.RawMessage, resource string) ([]T, error) {
+	var out []T
+	if len(raw) > 0 && raw[0] == '[' {
+		if err := json.Unmarshal(raw, &out); err != nil {
+			return nil, fmt.Errorf("unmarshal %s list: %w", resource, err)
+		}
+		return out, nil
+	}
+	var page struct {
+		Items []T `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &page); err != nil {
+		return nil, fmt.Errorf("unmarshal %s page: %w", resource, err)
+	}
+	return page.Items, nil
+}
+
+func (c *Client) prepareTenantNamespace(body any) (map[string]any, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request body: %w", err)
+	}
+	var prepared map[string]any
+	if err := json.Unmarshal(data, &prepared); err != nil {
+		return nil, fmt.Errorf("normalize request body: %w", err)
+	}
+	tenantID, _ := prepared["tenant_id"].(string)
+	if tenantID == "" {
+		tenantID = c.tenantID
+	}
+	if tenantID == "" {
+		return nil, fmt.Errorf("tenant_id is required")
+	}
+	prepared["tenant_id"] = tenantID
+	setDefault(prepared, "namespace", "default")
+	return prepared, nil
+}
+
 // GetSequence retrieves a sequence definition by ID.
 func (c *Client) GetSequence(ctx context.Context, id string) (*SequenceDefinition, error) {
 	var out SequenceDefinition
-	if err := c.do(ctx, http.MethodGet, "/sequences/"+id, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/sequences/"+pathSegment(id), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -148,7 +383,7 @@ func (c *Client) GetSequenceByName(ctx context.Context, tenantID, namespace, nam
 
 // DeprecateSequence marks a sequence as deprecated.
 func (c *Client) DeprecateSequence(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodPost, "/sequences/"+id+"/deprecate", nil, nil)
+	return c.do(ctx, http.MethodPost, "/sequences/"+pathSegment(id)+"/deprecate", nil, nil)
 }
 
 // ListSequenceVersions lists all versions of a sequence by tenant, namespace, and name.
@@ -175,16 +410,16 @@ func (c *Client) ListSequences(ctx context.Context, filter map[string]string) ([
 		}
 		path += "?" + params.Encode()
 	}
-	var out []SequenceDefinition
-	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+	var raw json.RawMessage
+	if err := c.do(ctx, http.MethodGet, path, nil, &raw); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return decodeList[SequenceDefinition](raw, "sequence")
 }
 
 // DeleteSequence deletes a sequence definition by ID.
 func (c *Client) DeleteSequence(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/sequences/"+id, nil, nil)
+	return c.do(ctx, http.MethodDelete, "/sequences/"+pathSegment(id), nil, nil)
 }
 
 // MigrateInstance migrates an instance to a different sequence version.
@@ -202,8 +437,12 @@ func (c *Client) MigrateInstance(ctx context.Context, body any) (*TaskInstance, 
 
 // CreateInstance creates a new task instance.
 func (c *Client) CreateInstance(ctx context.Context, body any) (*TaskInstance, error) {
+	prepared, err := c.prepareTenantNamespace(body)
+	if err != nil {
+		return nil, fmt.Errorf("create instance: %w", err)
+	}
 	var out TaskInstance
-	if err := c.do(ctx, http.MethodPost, "/instances", body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/instances", prepared, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -211,8 +450,26 @@ func (c *Client) CreateInstance(ctx context.Context, body any) (*TaskInstance, e
 
 // BatchCreateInstances creates multiple task instances in one call.
 func (c *Client) BatchCreateInstances(ctx context.Context, body any) (*BatchCreateResponse, error) {
+	data, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal instance batch: %w", err)
+	}
+	var request struct {
+		Instances []json.RawMessage `json:"instances"`
+	}
+	if err := json.Unmarshal(data, &request); err != nil {
+		return nil, fmt.Errorf("normalize instance batch: %w", err)
+	}
+	instances := make([]map[string]any, 0, len(request.Instances))
+	for _, raw := range request.Instances {
+		prepared, err := c.prepareTenantNamespace(raw)
+		if err != nil {
+			return nil, fmt.Errorf("create instance batch: %w", err)
+		}
+		instances = append(instances, prepared)
+	}
 	var out BatchCreateResponse
-	if err := c.do(ctx, http.MethodPost, "/instances/batch", body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/instances/batch", map[string]any{"instances": instances}, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -221,7 +478,7 @@ func (c *Client) BatchCreateInstances(ctx context.Context, body any) (*BatchCrea
 // GetInstance retrieves a task instance by ID.
 func (c *Client) GetInstance(ctx context.Context, id string) (*TaskInstance, error) {
 	var out TaskInstance
-	if err := c.do(ctx, http.MethodGet, "/instances/"+id, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/instances/"+pathSegment(id), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -237,30 +494,30 @@ func (c *Client) ListInstances(ctx context.Context, filter map[string]string) ([
 		}
 		path += "?" + params.Encode()
 	}
-	var out []TaskInstance
-	if err := c.do(ctx, http.MethodGet, path, nil, &out); err != nil {
+	var raw json.RawMessage
+	if err := c.do(ctx, http.MethodGet, path, nil, &raw); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return decodeList[TaskInstance](raw, "instance")
 }
 
 // UpdateInstanceState updates the state of an instance. The engine returns
 // 200 with an empty body — call GetInstance if the updated record is needed.
 func (c *Client) UpdateInstanceState(ctx context.Context, id string, body any) error {
-	return c.do(ctx, http.MethodPatch, "/instances/"+id+"/state", body, nil)
+	return c.do(ctx, http.MethodPatch, "/instances/"+pathSegment(id)+"/state", body, nil)
 }
 
 // UpdateInstanceContext updates the context of an instance. The engine
 // returns 200 with an empty body.
 func (c *Client) UpdateInstanceContext(ctx context.Context, id string, body any) error {
-	return c.do(ctx, http.MethodPatch, "/instances/"+id+"/context", body, nil)
+	return c.do(ctx, http.MethodPatch, "/instances/"+pathSegment(id)+"/context", body, nil)
 }
 
 // SendSignal sends a signal to an instance and returns the generated
 // signal ID so callers can correlate delivery events.
 func (c *Client) SendSignal(ctx context.Context, id string, body any) (*SignalResponse, error) {
 	var out SignalResponse
-	if err := c.do(ctx, http.MethodPost, "/instances/"+id+"/signals", body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/instances/"+pathSegment(id)+"/signals", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -269,7 +526,7 @@ func (c *Client) SendSignal(ctx context.Context, id string, body any) (*SignalRe
 // GetOutputs retrieves step outputs for an instance.
 func (c *Client) GetOutputs(ctx context.Context, id string) ([]StepOutput, error) {
 	var out []StepOutput
-	if err := c.do(ctx, http.MethodGet, "/instances/"+id+"/outputs", nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/instances/"+pathSegment(id)+"/outputs", nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -278,7 +535,7 @@ func (c *Client) GetOutputs(ctx context.Context, id string) ([]StepOutput, error
 // GetExecutionTree retrieves the execution tree for an instance.
 func (c *Client) GetExecutionTree(ctx context.Context, id string) ([]ExecutionNode, error) {
 	var out []ExecutionNode
-	if err := c.do(ctx, http.MethodGet, "/instances/"+id+"/tree", nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/instances/"+pathSegment(id)+"/tree", nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -287,7 +544,7 @@ func (c *Client) GetExecutionTree(ctx context.Context, id string) ([]ExecutionNo
 // RetryInstance retries a failed instance.
 func (c *Client) RetryInstance(ctx context.Context, id string) (*TaskInstance, error) {
 	var out TaskInstance
-	if err := c.do(ctx, http.MethodPost, "/instances/"+id+"/retry", nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/instances/"+pathSegment(id)+"/retry", nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -296,7 +553,7 @@ func (c *Client) RetryInstance(ctx context.Context, id string) (*TaskInstance, e
 // ListCheckpoints lists checkpoints for an instance.
 func (c *Client) ListCheckpoints(ctx context.Context, instanceID string) ([]Checkpoint, error) {
 	var out []Checkpoint
-	if err := c.do(ctx, http.MethodGet, "/instances/"+instanceID+"/checkpoints", nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/instances/"+pathSegment(instanceID)+"/checkpoints", nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -305,7 +562,7 @@ func (c *Client) ListCheckpoints(ctx context.Context, instanceID string) ([]Chec
 // SaveCheckpoint saves a checkpoint for an instance.
 func (c *Client) SaveCheckpoint(ctx context.Context, instanceID string, body any) (*Checkpoint, error) {
 	var out Checkpoint
-	if err := c.do(ctx, http.MethodPost, "/instances/"+instanceID+"/checkpoints", body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/instances/"+pathSegment(instanceID)+"/checkpoints", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -314,7 +571,7 @@ func (c *Client) SaveCheckpoint(ctx context.Context, instanceID string, body any
 // GetLatestCheckpoint retrieves the latest checkpoint for an instance.
 func (c *Client) GetLatestCheckpoint(ctx context.Context, instanceID string) (*Checkpoint, error) {
 	var out Checkpoint
-	if err := c.do(ctx, http.MethodGet, "/instances/"+instanceID+"/checkpoints/latest", nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/instances/"+pathSegment(instanceID)+"/checkpoints/latest", nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -329,18 +586,18 @@ func (c *Client) PruneCheckpoints(ctx context.Context, instanceID string, keepLa
 	if keepLast != nil {
 		body = map[string]int{"keep": *keepLast}
 	}
-	return c.do(ctx, http.MethodPost, "/instances/"+instanceID+"/checkpoints/prune", body, nil)
+	return c.do(ctx, http.MethodPost, "/instances/"+pathSegment(instanceID)+"/checkpoints/prune", body, nil)
 }
 
 // InjectBlocks injects blocks into a running instance.
 func (c *Client) InjectBlocks(ctx context.Context, id string, body any) error {
-	return c.do(ctx, http.MethodPost, "/instances/"+id+"/inject-blocks", body, nil)
+	return c.do(ctx, http.MethodPost, "/instances/"+pathSegment(id)+"/inject-blocks", body, nil)
 }
 
 // ListAuditLog retrieves the audit log for an instance.
 func (c *Client) ListAuditLog(ctx context.Context, instanceID string) ([]AuditEntry, error) {
 	var out []AuditEntry
-	if err := c.do(ctx, http.MethodGet, "/instances/"+instanceID+"/audit", nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/instances/"+pathSegment(instanceID)+"/audit", nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -418,7 +675,7 @@ func (c *Client) ListCron(ctx context.Context, tenantID string) ([]CronSchedule,
 // GetCron retrieves a cron schedule by ID.
 func (c *Client) GetCron(ctx context.Context, id string) (*CronSchedule, error) {
 	var out CronSchedule
-	if err := c.do(ctx, http.MethodGet, "/cron/"+id, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/cron/"+pathSegment(id), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -427,7 +684,7 @@ func (c *Client) GetCron(ctx context.Context, id string) (*CronSchedule, error) 
 // UpdateCron updates an existing cron schedule.
 func (c *Client) UpdateCron(ctx context.Context, id string, body any) (*CronSchedule, error) {
 	var out CronSchedule
-	if err := c.do(ctx, http.MethodPut, "/cron/"+id, body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPut, "/cron/"+pathSegment(id), body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -435,7 +692,7 @@ func (c *Client) UpdateCron(ctx context.Context, id string, body any) (*CronSche
 
 // DeleteCron deletes a cron schedule.
 func (c *Client) DeleteCron(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/cron/"+id, nil, nil)
+	return c.do(ctx, http.MethodDelete, "/cron/"+pathSegment(id), nil, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -467,7 +724,7 @@ func (c *Client) ListTriggers(ctx context.Context, tenantID string) ([]TriggerDe
 // GetTrigger retrieves a trigger by slug.
 func (c *Client) GetTrigger(ctx context.Context, slug string) (*TriggerDef, error) {
 	var out TriggerDef
-	if err := c.do(ctx, http.MethodGet, "/triggers/"+slug, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/triggers/"+pathSegment(slug), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -475,13 +732,13 @@ func (c *Client) GetTrigger(ctx context.Context, slug string) (*TriggerDef, erro
 
 // DeleteTrigger deletes a trigger by slug.
 func (c *Client) DeleteTrigger(ctx context.Context, slug string) error {
-	return c.do(ctx, http.MethodDelete, "/triggers/"+slug, nil, nil)
+	return c.do(ctx, http.MethodDelete, "/triggers/"+pathSegment(slug), nil, nil)
 }
 
 // FireTrigger fires a trigger by slug with optional data payload.
 func (c *Client) FireTrigger(ctx context.Context, slug string, data any) (*FireTriggerResponse, error) {
 	var out FireTriggerResponse
-	if err := c.do(ctx, http.MethodPost, "/triggers/"+slug+"/fire", data, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/triggers/"+pathSegment(slug)+"/fire", data, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -516,7 +773,7 @@ func (c *Client) ListPlugins(ctx context.Context, tenantID string) ([]PluginDef,
 // GetPlugin retrieves a plugin by name.
 func (c *Client) GetPlugin(ctx context.Context, name string) (*PluginDef, error) {
 	var out PluginDef
-	if err := c.do(ctx, http.MethodGet, "/plugins/"+name, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/plugins/"+pathSegment(name), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -525,7 +782,7 @@ func (c *Client) GetPlugin(ctx context.Context, name string) (*PluginDef, error)
 // UpdatePlugin updates an existing plugin.
 func (c *Client) UpdatePlugin(ctx context.Context, name string, update any) (*PluginDef, error) {
 	var out PluginDef
-	if err := c.do(ctx, http.MethodPatch, "/plugins/"+name, update, &out); err != nil {
+	if err := c.do(ctx, http.MethodPatch, "/plugins/"+pathSegment(name), update, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -533,7 +790,7 @@ func (c *Client) UpdatePlugin(ctx context.Context, name string, update any) (*Pl
 
 // DeletePlugin deletes a plugin by name.
 func (c *Client) DeletePlugin(ctx context.Context, name string) error {
-	return c.do(ctx, http.MethodDelete, "/plugins/"+name, nil, nil)
+	return c.do(ctx, http.MethodDelete, "/plugins/"+pathSegment(name), nil, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -552,7 +809,7 @@ func (c *Client) CreateSession(ctx context.Context, body any) (*Session, error) 
 // GetSession retrieves a session by ID.
 func (c *Client) GetSession(ctx context.Context, id string) (*Session, error) {
 	var out Session
-	if err := c.do(ctx, http.MethodGet, "/sessions/"+id, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/sessions/"+pathSegment(id), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -561,7 +818,7 @@ func (c *Client) GetSession(ctx context.Context, id string) (*Session, error) {
 // GetSessionByKey retrieves a session by tenant ID and key.
 func (c *Client) GetSessionByKey(ctx context.Context, tenantID, key string) (*Session, error) {
 	var out Session
-	if err := c.do(ctx, http.MethodGet, "/sessions/by-key/"+tenantID+"/"+key, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/sessions/by-key/"+pathSegment(tenantID)+"/"+key, nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -570,7 +827,7 @@ func (c *Client) GetSessionByKey(ctx context.Context, tenantID, key string) (*Se
 // UpdateSessionData updates the data of a session.
 func (c *Client) UpdateSessionData(ctx context.Context, id string, body any) (*Session, error) {
 	var out Session
-	if err := c.do(ctx, http.MethodPatch, "/sessions/"+id+"/data", body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPatch, "/sessions/"+pathSegment(id)+"/data", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -579,7 +836,7 @@ func (c *Client) UpdateSessionData(ctx context.Context, id string, body any) (*S
 // UpdateSessionState updates the state of a session.
 func (c *Client) UpdateSessionState(ctx context.Context, id string, body any) (*Session, error) {
 	var out Session
-	if err := c.do(ctx, http.MethodPatch, "/sessions/"+id+"/state", body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPatch, "/sessions/"+pathSegment(id)+"/state", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -588,7 +845,7 @@ func (c *Client) UpdateSessionState(ctx context.Context, id string, body any) (*
 // ListSessionInstances lists task instances associated with a session.
 func (c *Client) ListSessionInstances(ctx context.Context, id string) ([]TaskInstance, error) {
 	var out []TaskInstance
-	if err := c.do(ctx, http.MethodGet, "/sessions/"+id+"/instances", nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/sessions/"+pathSegment(id)+"/instances", nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -618,7 +875,7 @@ func (c *Client) CompleteTask(ctx context.Context, taskID string, workerID strin
 		"worker_id": workerID,
 		"output":    output,
 	}
-	return c.do(ctx, http.MethodPost, "/workers/tasks/"+taskID+"/complete", body, nil)
+	return c.do(ctx, http.MethodPost, "/workers/tasks/"+pathSegment(taskID)+"/complete", body, nil)
 }
 
 // FailTask marks a worker task as failed.
@@ -628,15 +885,33 @@ func (c *Client) FailTask(ctx context.Context, taskID, workerID, message string,
 		"message":   message,
 		"retryable": retryable,
 	}
-	return c.do(ctx, http.MethodPost, "/workers/tasks/"+taskID+"/fail", body, nil)
+	return c.do(ctx, http.MethodPost, "/workers/tasks/"+pathSegment(taskID)+"/fail", body, nil)
 }
 
 // HeartbeatTask sends a heartbeat for an in-flight worker task.
 func (c *Client) HeartbeatTask(ctx context.Context, taskID, workerID string) error {
+	_, err := c.HeartbeatTaskWithCheckpoint(ctx, taskID, workerID, nil, nil)
+	return err
+}
+
+// HeartbeatTaskWithCheckpoint heartbeats a task and optionally advances its
+// resumable checkpoint using optimistic checkpoint sequencing.
+func (c *Client) HeartbeatTaskWithCheckpoint(ctx context.Context, taskID, workerID string, checkpoint any, checkpointSeq *uint64) (*HeartbeatResponse, error) {
 	body := map[string]any{
 		"worker_id": workerID,
 	}
-	return c.do(ctx, http.MethodPost, "/workers/tasks/"+taskID+"/heartbeat", body, nil)
+	if checkpoint != nil {
+		if checkpointSeq == nil {
+			return nil, fmt.Errorf("checkpointSeq is required with checkpoint")
+		}
+		body["checkpoint"] = checkpoint
+		body["checkpoint_seq"] = *checkpointSeq
+	}
+	var out HeartbeatResponse
+	if err := c.do(ctx, http.MethodPost, "/workers/tasks/"+pathSegment(taskID)+"/heartbeat", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // ListWorkerTasks lists worker tasks with optional filters.
@@ -716,7 +991,7 @@ func (c *Client) ListClusterNodes(ctx context.Context) ([]ClusterNode, error) {
 
 // DrainNode initiates draining of a cluster node.
 func (c *Client) DrainNode(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodPost, "/cluster/nodes/"+id+"/drain", nil, nil)
+	return c.do(ctx, http.MethodPost, "/cluster/nodes/"+pathSegment(id)+"/drain", nil, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -735,7 +1010,7 @@ func (c *Client) ListCircuitBreakers(ctx context.Context) ([]CircuitBreakerState
 // GetCircuitBreaker retrieves a circuit breaker by handler name.
 func (c *Client) GetCircuitBreaker(ctx context.Context, handler string) (*CircuitBreakerState, error) {
 	var out CircuitBreakerState
-	if err := c.do(ctx, http.MethodGet, "/circuit-breakers/"+handler, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/circuit-breakers/"+pathSegment(handler), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -743,7 +1018,7 @@ func (c *Client) GetCircuitBreaker(ctx context.Context, handler string) (*Circui
 
 // ResetCircuitBreaker resets a circuit breaker by handler name.
 func (c *Client) ResetCircuitBreaker(ctx context.Context, handler string) error {
-	return c.do(ctx, http.MethodPost, "/circuit-breakers/"+handler+"/reset", nil, nil)
+	return c.do(ctx, http.MethodPost, "/circuit-breakers/"+pathSegment(handler)+"/reset", nil, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -788,7 +1063,7 @@ func (c *Client) CreatePool(ctx context.Context, body any) (*ResourcePool, error
 // GetPool retrieves a resource pool by ID.
 func (c *Client) GetPool(ctx context.Context, id string) (*ResourcePool, error) {
 	var out ResourcePool
-	if err := c.do(ctx, http.MethodGet, "/pools/"+id, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/pools/"+pathSegment(id), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -796,13 +1071,13 @@ func (c *Client) GetPool(ctx context.Context, id string) (*ResourcePool, error) 
 
 // DeletePool deletes a resource pool by ID.
 func (c *Client) DeletePool(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/pools/"+id, nil, nil)
+	return c.do(ctx, http.MethodDelete, "/pools/"+pathSegment(id), nil, nil)
 }
 
 // ListPoolResources lists resources within a pool.
 func (c *Client) ListPoolResources(ctx context.Context, poolID string) ([]PoolResource, error) {
 	var out []PoolResource
-	if err := c.do(ctx, http.MethodGet, "/pools/"+poolID+"/resources", nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/pools/"+pathSegment(poolID)+"/resources", nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -811,7 +1086,7 @@ func (c *Client) ListPoolResources(ctx context.Context, poolID string) ([]PoolRe
 // CreatePoolResource creates a new resource within a pool.
 func (c *Client) CreatePoolResource(ctx context.Context, poolID string, body any) (*PoolResource, error) {
 	var out PoolResource
-	if err := c.do(ctx, http.MethodPost, "/pools/"+poolID+"/resources", body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPost, "/pools/"+pathSegment(poolID)+"/resources", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -820,7 +1095,7 @@ func (c *Client) CreatePoolResource(ctx context.Context, poolID string, body any
 // UpdatePoolResource updates an existing resource within a pool.
 func (c *Client) UpdatePoolResource(ctx context.Context, poolID, resourceID string, body any) (*PoolResource, error) {
 	var out PoolResource
-	if err := c.do(ctx, http.MethodPut, "/pools/"+poolID+"/resources/"+resourceID, body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPut, "/pools/"+pathSegment(poolID)+"/resources/"+pathSegment(resourceID), body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -828,7 +1103,7 @@ func (c *Client) UpdatePoolResource(ctx context.Context, poolID, resourceID stri
 
 // DeletePoolResource deletes a resource from a pool.
 func (c *Client) DeletePoolResource(ctx context.Context, poolID, resourceID string) error {
-	return c.do(ctx, http.MethodDelete, "/pools/"+poolID+"/resources/"+resourceID, nil, nil)
+	return c.do(ctx, http.MethodDelete, "/pools/"+pathSegment(poolID)+"/resources/"+pathSegment(resourceID), nil, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -860,7 +1135,7 @@ func (c *Client) CreateCredential(ctx context.Context, body any) (*Credential, e
 // GetCredential retrieves a credential by ID.
 func (c *Client) GetCredential(ctx context.Context, id string) (*Credential, error) {
 	var out Credential
-	if err := c.do(ctx, http.MethodGet, "/credentials/"+id, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/credentials/"+pathSegment(id), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -868,13 +1143,13 @@ func (c *Client) GetCredential(ctx context.Context, id string) (*Credential, err
 
 // DeleteCredential deletes a credential by ID.
 func (c *Client) DeleteCredential(ctx context.Context, id string) error {
-	return c.do(ctx, http.MethodDelete, "/credentials/"+id, nil, nil)
+	return c.do(ctx, http.MethodDelete, "/credentials/"+pathSegment(id), nil, nil)
 }
 
 // UpdateCredential partially updates a credential by ID.
 func (c *Client) UpdateCredential(ctx context.Context, id string, body any) (*Credential, error) {
 	var out Credential
-	if err := c.do(ctx, http.MethodPatch, "/credentials/"+id, body, &out); err != nil {
+	if err := c.do(ctx, http.MethodPatch, "/credentials/"+pathSegment(id), body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -887,7 +1162,7 @@ func (c *Client) UpdateCredential(ctx context.Context, id string, body any) (*Cr
 // ListTenantCircuitBreakers lists circuit breakers for a specific tenant.
 func (c *Client) ListTenantCircuitBreakers(ctx context.Context, tenantID string) ([]CircuitBreakerState, error) {
 	var out []CircuitBreakerState
-	if err := c.do(ctx, http.MethodGet, "/tenants/"+tenantID+"/circuit-breakers", nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/tenants/"+pathSegment(tenantID)+"/circuit-breakers", nil, &out); err != nil {
 		return nil, err
 	}
 	return out, nil
@@ -896,7 +1171,7 @@ func (c *Client) ListTenantCircuitBreakers(ctx context.Context, tenantID string)
 // GetTenantCircuitBreaker retrieves a circuit breaker for a specific tenant and handler.
 func (c *Client) GetTenantCircuitBreaker(ctx context.Context, tenantID, handler string) (*CircuitBreakerState, error) {
 	var out CircuitBreakerState
-	if err := c.do(ctx, http.MethodGet, "/tenants/"+tenantID+"/circuit-breakers/"+handler, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/tenants/"+pathSegment(tenantID)+"/circuit-breakers/"+pathSegment(handler), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -904,7 +1179,7 @@ func (c *Client) GetTenantCircuitBreaker(ctx context.Context, tenantID, handler 
 
 // ResetTenantCircuitBreaker resets a circuit breaker for a specific tenant and handler.
 func (c *Client) ResetTenantCircuitBreaker(ctx context.Context, tenantID, handler string) error {
-	return c.do(ctx, http.MethodPost, "/tenants/"+tenantID+"/circuit-breakers/"+handler+"/reset", nil, nil)
+	return c.do(ctx, http.MethodPost, "/tenants/"+pathSegment(tenantID)+"/circuit-breakers/"+pathSegment(handler)+"/reset", nil, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -945,7 +1220,7 @@ func (c *Client) ListMobileApprovals(ctx context.Context) (*MobileApprovalsRespo
 
 // ResolveMobileApproval resolves a mobile approval by ID.
 func (c *Client) ResolveMobileApproval(ctx context.Context, id string, body *ResolveApprovalRequest) error {
-	return c.do(ctx, http.MethodPost, "/mobile/approvals/"+id+"/resolve", body, nil)
+	return c.do(ctx, http.MethodPost, "/mobile/approvals/"+pathSegment(id)+"/resolve", body, nil)
 }
 
 // ListMobileStatus lists the mobile status of instances.
@@ -1032,7 +1307,7 @@ func (c *Client) ListRollbackPolicies(ctx context.Context, tenantID string) ([]R
 // GetRollbackPolicy retrieves a rollback policy by name.
 func (c *Client) GetRollbackPolicy(ctx context.Context, name string) (*RollbackPolicy, error) {
 	var out RollbackPolicy
-	if err := c.do(ctx, http.MethodGet, "/rollback-policies/"+name, nil, &out); err != nil {
+	if err := c.do(ctx, http.MethodGet, "/rollback-policies/"+pathSegment(name), nil, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
@@ -1040,7 +1315,7 @@ func (c *Client) GetRollbackPolicy(ctx context.Context, name string) (*RollbackP
 
 // DeleteRollbackPolicy deletes a rollback policy by name.
 func (c *Client) DeleteRollbackPolicy(ctx context.Context, name string) error {
-	return c.do(ctx, http.MethodDelete, "/rollback-policies/"+name, nil, nil)
+	return c.do(ctx, http.MethodDelete, "/rollback-policies/"+pathSegment(name), nil, nil)
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,16 +1328,67 @@ func (c *Client) DeleteRollbackPolicy(ctx context.Context, name string) error {
 func (c *Client) StreamInstance(ctx context.Context, instanceID string, pollMs int) (<-chan map[string]any, <-chan error) {
 	eventCh := make(chan map[string]any)
 	errCh := make(chan error, 1)
+	events, errors := c.StreamInstanceEvents(ctx, instanceID, InstanceStreamOptions{PollMs: pollMs})
 
 	go func() {
 		defer close(eventCh)
 		defer close(errCh)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				select {
+				case errCh <- fmt.Errorf("stream bridge panic: %v", recovered):
+				default:
+				}
+			}
+		}()
+		for events != nil || errors != nil {
+			select {
+			case event, ok := <-events:
+				if !ok {
+					events = nil
+					continue
+				}
+				select {
+				case eventCh <- event.Data:
+				case <-ctx.Done():
+					return
+				}
+			case err, ok := <-errors:
+				if !ok {
+					errors = nil
+					continue
+				}
+				errCh <- err
+			}
+		}
+	}()
+
+	return eventCh, errCh
+}
+
+// StreamInstanceEvents streams SSE envelopes and exposes IDs for resumption.
+func (c *Client) StreamInstanceEvents(ctx context.Context, instanceID string, options InstanceStreamOptions) (<-chan SSEEvent, <-chan error) {
+	eventCh := make(chan SSEEvent)
+	errCh := make(chan error, 1)
+
+	go func() {
+		defer close(eventCh)
+		defer close(errCh)
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				select {
+				case errCh <- fmt.Errorf("stream panic: %v", recovered):
+				default:
+				}
+			}
+		}()
 
 		params := url.Values{}
-		if pollMs > 0 {
+		if options.PollMs > 0 {
+			pollMs := max(100, min(options.PollMs, 5000))
 			params.Set("poll_ms", fmt.Sprintf("%d", pollMs))
 		}
-		path := "/instances/" + instanceID + "/stream"
+		path := "/instances/" + pathSegment(instanceID) + "/stream"
 		if len(params) > 0 {
 			path += "?" + params.Encode()
 		}
@@ -1074,14 +1400,29 @@ func (c *Client) StreamInstance(ctx context.Context, instanceID string, pollMs i
 		}
 
 		req.Header.Set("Accept", "text/event-stream")
+		if options.LastEventID != "" {
+			req.Header.Set("Last-Event-ID", options.LastEventID)
+		}
 		if c.tenantID != "" {
 			req.Header.Set("X-Tenant-Id", c.tenantID)
 		}
 		for k, v := range c.headers {
 			req.Header.Set(k, v)
 		}
+		if c.getHeaders != nil {
+			dynamicHeaders, err := c.getHeaders(ctx)
+			if err != nil {
+				errCh <- fmt.Errorf("resolve request headers: %w", err)
+				return
+			}
+			for k, v := range dynamicHeaders {
+				req.Header.Set(k, v)
+			}
+		}
 
-		resp, err := c.http.Do(req)
+		streamHTTP := *c.http
+		streamHTTP.Timeout = 0
+		resp, err := streamHTTP.Do(req)
 		if err != nil {
 			errCh <- fmt.Errorf("execute request: %w", err)
 			return
@@ -1089,7 +1430,11 @@ func (c *Client) StreamInstance(ctx context.Context, instanceID string, pollMs i
 		defer resp.Body.Close()
 
 		if resp.StatusCode >= 400 {
-			body, _ := io.ReadAll(resp.Body)
+			body, readErr := io.ReadAll(resp.Body)
+			if readErr != nil {
+				errCh <- fmt.Errorf("read error response: %w", readErr)
+				return
+			}
 			errCh <- &Orch8Error{
 				Status: resp.StatusCode,
 				Body:   string(body),
@@ -1100,27 +1445,48 @@ func (c *Client) StreamInstance(ctx context.Context, instanceID string, pollMs i
 
 		scanner := bufio.NewScanner(resp.Body)
 		scanner.Buffer(make([]byte, 4096), 1024*1024) // 1MB max line size for large SSE payloads
-		for scanner.Scan() {
-			line := scanner.Text()
-			if !strings.HasPrefix(line, "data: ") {
-				continue
+		var eventID, eventType string
+		dataLines := []string{}
+		emit := func() bool {
+			if len(dataLines) == 0 {
+				return true
 			}
-			data := strings.TrimPrefix(line, "data: ")
-			if data == "" {
-				continue
+			raw := strings.Join(dataLines, "\n")
+			dataLines = nil
+			if raw == "" || raw == "[DONE]" {
+				return true
 			}
-
-			var event map[string]any
-			if err := json.Unmarshal([]byte(data), &event); err != nil {
+			var data map[string]any
+			if err := json.Unmarshal([]byte(raw), &data); err != nil {
 				errCh <- fmt.Errorf("unmarshal SSE event: %w", err)
-				return
+				return false
 			}
-
+			event := SSEEvent{ID: eventID, Event: eventType, Data: data}
+			eventID, eventType = "", ""
 			select {
 			case eventCh <- event:
+				return true
 			case <-ctx.Done():
-				return
+				return false
 			}
+		}
+		for scanner.Scan() {
+			line := scanner.Text()
+			switch {
+			case strings.HasPrefix(line, "id:"):
+				eventID = strings.TrimSpace(strings.TrimPrefix(line, "id:"))
+			case strings.HasPrefix(line, "event:"):
+				eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			case strings.HasPrefix(line, "data:"):
+				dataLines = append(dataLines, strings.TrimSpace(strings.TrimPrefix(line, "data:")))
+			case strings.TrimSpace(line) == "":
+				if !emit() {
+					return
+				}
+			}
+		}
+		if !emit() {
+			return
 		}
 
 		if err := scanner.Err(); err != nil {

@@ -32,6 +32,14 @@ type WorkerConfig struct {
 	Logger *slog.Logger
 }
 
+// WorkerRuntimeStats is a language-neutral snapshot of worker capacity.
+type WorkerRuntimeStats struct {
+	Running        bool
+	InFlight       int
+	AvailableSlots int
+	Handlers       []string
+}
+
 // maxBackoff is the upper bound for exponential backoff on poll failures.
 const maxBackoff = 30 * time.Second
 
@@ -50,6 +58,7 @@ type Worker struct {
 	logger              *slog.Logger
 
 	cancel   context.CancelFunc
+	running  bool
 	sem      chan struct{}
 	wg       sync.WaitGroup
 	mu       sync.Mutex
@@ -97,6 +106,7 @@ func NewWorker(cfg WorkerConfig) *Worker {
 func (w *Worker) Start(ctx context.Context) {
 	w.mu.Lock()
 	ctx, w.cancel = context.WithCancel(ctx)
+	w.running = true
 	w.mu.Unlock()
 
 	// Start heartbeat goroutine.
@@ -121,6 +131,10 @@ func (w *Worker) Start(ctx context.Context) {
 
 	// Wait for all in-flight tasks to finish.
 	w.wg.Wait()
+	w.mu.Lock()
+	w.running = false
+	w.cancel = nil
+	w.mu.Unlock()
 }
 
 // Stop signals the worker to stop polling and waits for in-flight tasks to complete.
@@ -130,6 +144,23 @@ func (w *Worker) Stop() {
 		w.cancel()
 	}
 	w.mu.Unlock()
+}
+
+// Stats returns the current worker capacity without exposing mutable internals.
+func (w *Worker) Stats() WorkerRuntimeStats {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	handlers := make([]string, 0, len(w.handlers))
+	for handler := range w.handlers {
+		handlers = append(handlers, handler)
+	}
+	inFlight := len(w.inflight)
+	return WorkerRuntimeStats{
+		Running:        w.running,
+		InFlight:       inFlight,
+		AvailableSlots: w.maxConcurrent - inFlight,
+		Handlers:       handlers,
+	}
 }
 
 func (w *Worker) pollLoop(ctx context.Context, handlerName string) {
@@ -257,7 +288,7 @@ func (w *Worker) executeTask(ctx context.Context, task WorkerTask) {
 			w.logger.Error("failed to report failure", "task", task.ID, "error", failErr)
 		}
 		if w.onTaskFail != nil {
-			w.onTaskFail(task, err)
+			w.notify(func() { w.onTaskFail(task, err) })
 		}
 		return
 	}
@@ -269,8 +300,13 @@ func (w *Worker) executeTask(ctx context.Context, task WorkerTask) {
 		w.logger.Error("failed to report completion", "task", task.ID, "error", err)
 	}
 	if w.onTaskComplete != nil {
-		w.onTaskComplete(task, output)
+		w.notify(func() { w.onTaskComplete(task, output) })
 	}
+}
+
+func (w *Worker) notify(callback func()) {
+	defer func() { _ = recover() }()
+	callback()
 }
 
 func (w *Worker) heartbeatLoop(ctx context.Context) {

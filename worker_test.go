@@ -29,6 +29,10 @@ func TestNewWorkerDefaults(t *testing.T) {
 	if cap(w.sem) != 10 {
 		t.Errorf("expected semaphore capacity 10, got %d", cap(w.sem))
 	}
+	stats := w.Stats()
+	if stats.Running || stats.InFlight != 0 || stats.AvailableSlots != 10 || len(stats.Handlers) != 1 {
+		t.Fatalf("unexpected worker stats: %+v", stats)
+	}
 }
 
 func TestWorkerStartStop(t *testing.T) {
