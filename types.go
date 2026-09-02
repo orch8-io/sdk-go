@@ -38,20 +38,22 @@ type SSEEvent struct {
 
 // SequenceDefinition represents a registered sequence blueprint.
 type SequenceDefinition struct {
-	ID           string `json:"id"`
-	TenantID     string `json:"tenant_id"`
-	Namespace    string `json:"namespace"`
-	Name         string `json:"name"`
-	Version      int    `json:"version"`
-	Deprecated   bool   `json:"deprecated"`
-	Blocks       []any  `json:"blocks"`
-	Interceptors any    `json:"interceptors,omitempty"`
-	InputSchema  any    `json:"input_schema,omitempty"`
-	SLA          any    `json:"sla,omitempty"`
-	OnFailure    []any  `json:"on_failure,omitempty"`
-	OnCancel     []any  `json:"on_cancel,omitempty"`
-	Status       string `json:"status,omitempty"`
-	CreatedAt    string `json:"created_at"`
+	SchemaVersion int    `json:"schema_version"`
+	SchemaURL     string `json:"$schema,omitempty"`
+	ID            string `json:"id"`
+	TenantID      string `json:"tenant_id"`
+	Namespace     string `json:"namespace"`
+	Name          string `json:"name"`
+	Version       int    `json:"version"`
+	Deprecated    bool   `json:"deprecated"`
+	Blocks        []any  `json:"blocks"`
+	Interceptors  any    `json:"interceptors,omitempty"`
+	InputSchema   any    `json:"input_schema,omitempty"`
+	SLA           any    `json:"sla,omitempty"`
+	OnFailure     []any  `json:"on_failure,omitempty"`
+	OnCancel      []any  `json:"on_cancel,omitempty"`
+	Status        string `json:"status,omitempty"`
+	CreatedAt     string `json:"created_at"`
 }
 
 // CreateSequenceResponse is returned after a sequence definition is accepted.
