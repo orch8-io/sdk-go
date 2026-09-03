@@ -47,6 +47,25 @@ func main() {
 }
 ```
 
+## Code-first workflow DSL
+
+```go
+type Charge struct { CustomerID string `json:"customer_id"`; Cents int `json:"cents"` }
+
+builder := orch8.Workflow("checkout")
+orch8.TypedStep(builder, "charge", "charge", Charge{CustomerID: "cus_123", Cents: 2500})
+definition := builder.Parallel("notify",
+    func(branch *orch8.WorkflowBuilder) { branch.Step("email", "send-email", map[string]any{"template": "receipt"}) },
+    func(branch *orch8.WorkflowBuilder) { branch.Step("audit", "write-audit", nil) },
+).Build()
+if err := builder.Err(); err != nil { log.Fatal(err) }
+```
+
+The builder covers all eleven block types. `TypedStep` retains the concrete
+handler parameter type while the encoded definition remains ordinary JSON.
+Router conditions use an ordered `[]orch8.Route`, so first-match priority is
+stable across runs.
+
 ```go
 var engineInfo map[string]any
 err := client.Request(ctx, http.MethodGet, "/info", nil, &engineInfo)
