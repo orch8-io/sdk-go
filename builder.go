@@ -7,17 +7,23 @@ type Block map[string]any
 
 // WorkflowDefinition is the authoring payload accepted by CreateSequence.
 type WorkflowDefinition struct {
-	Name      string  `json:"name"`
-	Namespace string  `json:"namespace"`
-	Blocks    []Block `json:"blocks"`
+	Name        string  `json:"name"`
+	Namespace   string  `json:"namespace"`
+	Blocks      []Block `json:"blocks"`
+	InputSchema any     `json:"input_schema,omitempty"`
+	OnFailure   []Block `json:"on_failure,omitempty"`
+	OnCancel    []Block `json:"on_cancel,omitempty"`
 }
 
 // WorkflowBuilder builds nested block trees without stringly-typed map assembly.
 type WorkflowBuilder struct {
-	name      string
-	namespace string
-	blocks    []Block
-	err       error
+	name        string
+	namespace   string
+	blocks      []Block
+	inputSchema any
+	onFailure   []Block
+	onCancel    []Block
+	err         error
 }
 
 type Branch func(*WorkflowBuilder)
@@ -152,7 +158,14 @@ func (b *WorkflowBuilder) Raw(block Block) *WorkflowBuilder {
 }
 
 func (b *WorkflowBuilder) Build() WorkflowDefinition {
-	return WorkflowDefinition{Name: b.name, Namespace: b.namespace, Blocks: append([]Block(nil), b.blocks...)}
+	return WorkflowDefinition{
+		Name:        b.name,
+		Namespace:   b.namespace,
+		Blocks:      append([]Block(nil), b.blocks...),
+		InputSchema: b.inputSchema,
+		OnFailure:   append([]Block(nil), b.onFailure...),
+		OnCancel:    append([]Block(nil), b.onCancel...),
+	}
 }
 
 // Err reports a builder-shape error, such as a saga action containing more
@@ -167,6 +180,9 @@ func (b *WorkflowBuilder) branch(branch Branch) []Block {
 	}
 	inner := &WorkflowBuilder{name: "_inner", namespace: b.namespace}
 	branch(inner)
+	if inner.err != nil && b.err == nil {
+		b.err = inner.err
+	}
 	return inner.blocks
 }
 
