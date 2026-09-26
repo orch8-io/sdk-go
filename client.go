@@ -49,6 +49,9 @@ type Client struct {
 	onRetry          func(error, int)
 	onRequest        func(RequestEvent)
 	onResponse       func(ResponseEvent)
+
+	// Jobs enqueues and inspects one-off background jobs (POST /jobs).
+	Jobs *JobsService
 }
 
 func pathSegment(value string) string {
@@ -69,7 +72,7 @@ func NewClient(cfg ClientConfig) *Client {
 	if retryBaseDelay == 0 {
 		retryBaseDelay = 250 * time.Millisecond
 	}
-	return &Client{
+	c := &Client{
 		baseURL:          strings.TrimRight(cfg.BaseURL, "/"),
 		tenantID:         cfg.TenantID,
 		headers:          cfg.Headers,
@@ -81,6 +84,8 @@ func NewClient(cfg ClientConfig) *Client {
 		onRequest:        cfg.OnRequest,
 		onResponse:       cfg.OnResponse,
 	}
+	c.Jobs = &JobsService{c: c}
+	return c
 }
 
 // do performs an HTTP request and decodes the response.
