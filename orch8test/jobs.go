@@ -160,17 +160,18 @@ func (e *Engine) handleJobs(w http.ResponseWriter, r *http.Request) {
 		}
 		start, _ := strconv.Atoi(q.Get("cursor"))
 		e.mu.Lock()
-		page := orch8.JobPage{Jobs: []orch8.Job{}}
+		page := orch8.JobPage{Items: []orch8.Job{}}
 		i := start
-		for ; i < len(e.jobOrder) && len(page.Jobs) < limit; i++ {
+		for ; i < len(e.jobOrder) && len(page.Items) < limit; i++ {
 			job := e.jobs[e.jobOrder[i]]
 			if (q.Get("handler") != "" && job.Handler != q.Get("handler")) || (q.Get("status") != "" && job.Status != q.Get("status")) {
 				continue
 			}
-			page.Jobs = append(page.Jobs, job.snapshot())
+			page.Items = append(page.Items, job.snapshot())
 		}
 		if i < len(e.jobOrder) {
 			page.NextCursor = strconv.Itoa(i)
+			page.HasMore = true
 		}
 		e.mu.Unlock()
 		writeJSON(w, http.StatusOK, page)

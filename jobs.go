@@ -84,8 +84,9 @@ type JobListOptions struct {
 
 // JobPage is one page of GET /jobs.
 type JobPage struct {
-	Jobs       []Job  `json:"jobs"`
+	Items      []Job  `json:"items"`
 	NextCursor string `json:"next_cursor,omitempty"`
+	HasMore    bool   `json:"has_more"`
 }
 
 // JobsService is the client for the engine's jobs API. The routes are not yet
@@ -188,13 +189,13 @@ func (it *JobIterator) Next() bool {
 			it.err = err
 			return false
 		}
-		it.buf = page.Jobs
+		it.buf = page.Items
 		if page.NextCursor == it.opts.Cursor && page.NextCursor != "" {
 			it.err = errors.New("orch8: job listing cursor did not advance")
 			return false
 		}
 		it.opts.Cursor = page.NextCursor
-		if len(page.Jobs) == 0 && page.NextCursor == "" {
+		if len(page.Items) == 0 && page.NextCursor == "" {
 			it.done = true
 			return false
 		}

@@ -50,9 +50,9 @@ func TestJobsListIteratesCursors(t *testing.T) {
 		}
 		switch q.Get("cursor") {
 		case "":
-			_ = json.NewEncoder(w).Encode(JobPage{Jobs: []Job{{ID: "1"}, {ID: "2"}}, NextCursor: "c2"})
+			_ = json.NewEncoder(w).Encode(JobPage{Items: []Job{{ID: "1"}, {ID: "2"}}, NextCursor: "c2"})
 		case "c2":
-			_ = json.NewEncoder(w).Encode(JobPage{Jobs: []Job{{ID: "3"}}})
+			_ = json.NewEncoder(w).Encode(JobPage{Items: []Job{{ID: "3"}}})
 		}
 	}))
 	defer srv.Close()
