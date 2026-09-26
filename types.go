@@ -200,6 +200,30 @@ type WorkerTask struct {
 	ResumeCheckpoint any    `json:"resume_checkpoint,omitempty"`
 	CheckpointSeq    uint64 `json:"checkpoint_seq"`
 	CreatedAt        string `json:"created_at"`
+	// ClaimEpoch is the ownership epoch issued at claim time. Echo it on every
+	// heartbeat, completion, and failure (see Lease).
+	ClaimEpoch uint64 `json:"claim_epoch"`
+}
+
+// TaskLease identifies ownership of a claimed task: the claiming worker and
+// the claim epoch the engine issued. Stale leases are rejected with 409.
+type TaskLease struct {
+	WorkerID   string `json:"worker_id"`
+	ClaimEpoch uint64 `json:"claim_epoch"`
+}
+
+// Lease returns the lease for this task as claimed by workerID.
+func (t WorkerTask) Lease(workerID string) TaskLease {
+	return TaskLease{WorkerID: workerID, ClaimEpoch: t.ClaimEpoch}
+}
+
+// PollBatch is the worker poll response. Hints are nil when talking to a
+// legacy engine that returned a bare task array.
+type PollBatch struct {
+	Tasks                 []WorkerTask `json:"tasks"`
+	LeaseSecs             *uint64      `json:"lease_secs,omitempty"`
+	HeartbeatIntervalSecs *uint64      `json:"heartbeat_interval_secs,omitempty"`
+	PollAfterMs           *uint64      `json:"poll_after_ms,omitempty"`
 }
 
 // HeartbeatResponse reports the current checkpoint sequence after a heartbeat.
@@ -680,18 +704,21 @@ type QueuePollRequest struct {
 
 // CompleteRequest is the typed request body for completing a task.
 type CompleteRequest struct {
-	WorkerID string `json:"worker_id"`
-	Output   any    `json:"output,omitempty"`
+	WorkerID   string `json:"worker_id"`
+	ClaimEpoch uint64 `json:"claim_epoch"`
+	Output     any    `json:"output,omitempty"`
 }
 
 // FailRequest is the typed request body for failing a task.
 type FailRequest struct {
-	WorkerID  string `json:"worker_id"`
-	Message   string `json:"message"`
-	Retryable bool   `json:"retryable"`
+	WorkerID   string `json:"worker_id"`
+	ClaimEpoch uint64 `json:"claim_epoch"`
+	Message    string `json:"message"`
+	Retryable  bool   `json:"retryable"`
 }
 
 // HeartbeatRequest is the typed request body for sending a heartbeat.
 type HeartbeatRequest struct {
-	WorkerID string `json:"worker_id"`
+	WorkerID   string `json:"worker_id"`
+	ClaimEpoch uint64 `json:"claim_epoch"`
 }

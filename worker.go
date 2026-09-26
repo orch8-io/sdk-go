@@ -62,8 +62,14 @@ type Worker struct {
 	sem      chan struct{}
 	wg       sync.WaitGroup
 	mu       sync.Mutex
-	inflight map[string]struct{}
+	inflight map[string]WorkerTask
 	backoff  map[string]time.Duration
+	// pollHints holds the server's minimum delay before the next poll.
+	pollHints map[string]time.Duration
+	// leaseHeartbeat is the heartbeat interval derived from poll hints
+	// (min of advertised interval and half the lease); zero when unknown.
+	leaseHeartbeat time.Duration
+	hbReset        chan struct{}
 }
 
 // NewWorker creates a new polling worker.
@@ -97,8 +103,10 @@ func NewWorker(cfg WorkerConfig) *Worker {
 		onTaskFail:          cfg.OnTaskFail,
 		logger:              logger,
 		sem:                 make(chan struct{}, maxConcurrent),
-		inflight:            make(map[string]struct{}),
+		inflight:            make(map[string]WorkerTask),
 		backoff:             make(map[string]time.Duration),
+		pollHints:           make(map[string]time.Duration),
+		hbReset:             make(chan struct{}, 1),
 	}
 }
 
@@ -170,9 +178,13 @@ func (w *Worker) pollLoop(ctx context.Context, handlerName string) {
 	for {
 		w.mu.Lock()
 		interval := w.backoff[handlerName]
+		hint := w.pollHints[handlerName]
 		w.mu.Unlock()
 		if interval == 0 {
 			interval = w.pollInterval
+		}
+		if hint > interval {
+			interval = hint
 		}
 
 		timer := time.NewTimer(interval)
@@ -205,7 +217,7 @@ func (w *Worker) poll(ctx context.Context, handlerName string) {
 		return
 	}
 
-	tasks, err := w.client.PollTasks(ctx, handlerName, w.workerID, limit)
+	batch, err := w.client.PollTaskBatch(ctx, handlerName, w.workerID, limit)
 	if err != nil {
 		if ctx.Err() == nil {
 			w.logger.Error("poll error", "handler", handlerName, "error", err)
@@ -225,10 +237,12 @@ func (w *Worker) poll(ctx context.Context, handlerName string) {
 		return
 	}
 
-	// Reset backoff on successful poll.
+	// Reset backoff on successful poll and record the server's timing hints.
 	w.mu.Lock()
 	delete(w.backoff, handlerName)
+	w.applyHintsLocked(handlerName, batch)
 	w.mu.Unlock()
+	tasks := batch.Tasks
 
 	if len(tasks) == 0 {
 		return
@@ -259,12 +273,13 @@ func (w *Worker) executeTask(ctx context.Context, task WorkerTask) {
 	}()
 
 	w.mu.Lock()
-	w.inflight[task.ID] = struct{}{}
+	w.inflight[task.ID] = task
 	w.mu.Unlock()
 
+	lease := task.Lease(w.workerID)
 	handler, ok := w.handlers[task.HandlerName]
 	if !ok {
-		if err := w.client.FailTask(ctx, task.ID, w.workerID, "no handler registered for \""+task.HandlerName+"\"", false); err != nil {
+		if err := w.client.FailTaskLease(ctx, task.ID, lease, "no handler registered for \""+task.HandlerName+"\"", false); err != nil {
 			w.logger.Error("failed to report missing handler", "task", task.ID, "error", err)
 		}
 		return
@@ -284,8 +299,10 @@ func (w *Worker) executeTask(ctx context.Context, task WorkerTask) {
 		if rerr, ok := err.(interface{ Retryable() bool }); ok {
 			retryable = rerr.Retryable()
 		}
-		if failErr := w.client.FailTask(ctx, task.ID, w.workerID, err.Error(), retryable); failErr != nil {
+		if failErr := w.client.FailTaskLease(ctx, task.ID, lease, err.Error(), retryable); failErr != nil {
+			// Leave the task for lease recovery; the failure was not acknowledged.
 			w.logger.Error("failed to report failure", "task", task.ID, "error", failErr)
+			return
 		}
 		if w.onTaskFail != nil {
 			w.notify(func() { w.onTaskFail(task, err) })
@@ -296,8 +313,11 @@ func (w *Worker) executeTask(ctx context.Context, task WorkerTask) {
 	if output == nil {
 		output = map[string]any{}
 	}
-	if err := w.client.CompleteTask(ctx, task.ID, w.workerID, output); err != nil {
+	if err := w.client.CompleteTaskLease(ctx, task.ID, lease, output); err != nil {
+		// A rejected or ambiguous acknowledgement is not a handler failure:
+		// never send a contradictory fail, and never report success.
 		w.logger.Error("failed to report completion", "task", task.ID, "error", err)
+		return
 	}
 	if w.onTaskComplete != nil {
 		w.notify(func() { w.onTaskComplete(task, output) })
@@ -309,25 +329,65 @@ func (w *Worker) notify(callback func()) {
 	callback()
 }
 
-func (w *Worker) heartbeatLoop(ctx context.Context) {
-	ticker := time.NewTicker(w.heartbeatInterval)
-	defer ticker.Stop()
+func (w *Worker) applyHintsLocked(handlerName string, batch *PollBatch) {
+	if batch.PollAfterMs != nil {
+		w.pollHints[handlerName] = time.Duration(*batch.PollAfterMs) * time.Millisecond
+	} else {
+		delete(w.pollHints, handlerName)
+	}
+	hb := time.Duration(0)
+	if batch.HeartbeatIntervalSecs != nil && *batch.HeartbeatIntervalSecs > 0 {
+		hb = time.Duration(*batch.HeartbeatIntervalSecs) * time.Second
+	}
+	if batch.LeaseSecs != nil && *batch.LeaseSecs > 0 {
+		half := time.Duration(*batch.LeaseSecs) * time.Second / 2
+		if hb == 0 || half < hb {
+			hb = half
+		}
+	}
+	if hb > 0 && (w.leaseHeartbeat == 0 || hb < w.leaseHeartbeat) {
+		w.leaseHeartbeat = hb
+		select {
+		case w.hbReset <- struct{}{}:
+		default:
+		}
+	}
+}
 
+// currentHeartbeatInterval is the configured interval, shortened to the
+// server-advertised heartbeat interval or half the lease when smaller.
+func (w *Worker) currentHeartbeatInterval() time.Duration {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	d := w.heartbeatInterval
+	if w.leaseHeartbeat > 0 && w.leaseHeartbeat < d {
+		d = w.leaseHeartbeat
+	}
+	return d
+}
+
+func (w *Worker) heartbeatLoop(ctx context.Context) {
 	for {
+		timer := time.NewTimer(w.currentHeartbeatInterval())
 		select {
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-ticker.C:
+		case <-w.hbReset:
+			// The lease-derived interval shrank; re-arm with the new value.
+			timer.Stop()
+			continue
+		case <-timer.C:
 			w.mu.Lock()
-			ids := make([]string, 0, len(w.inflight))
-			for id := range w.inflight {
-				ids = append(ids, id)
+			tasks := make([]WorkerTask, 0, len(w.inflight))
+			for _, task := range w.inflight {
+				tasks = append(tasks, task)
 			}
 			w.mu.Unlock()
 
-			for _, id := range ids {
-				if err := w.client.HeartbeatTask(ctx, id, w.workerID); err != nil && ctx.Err() == nil {
-					w.logger.Error("heartbeat error", "task", id, "error", err)
+			for _, task := range tasks {
+				if _, err := w.client.HeartbeatTaskLease(ctx, task.ID, task.Lease(w.workerID), nil, nil); err != nil && ctx.Err() == nil {
+					w.logger.Error("heartbeat error", "task", task.ID, "error", err)
 				}
 			}
 		}

@@ -855,50 +855,120 @@ func (c *Client) ListSessionInstances(ctx context.Context, id string) ([]TaskIns
 // Workers
 // ---------------------------------------------------------------------------
 
-// PollTasks polls for available worker tasks.
+// PollTasks polls for available worker tasks. Use PollTaskBatch to also read
+// the server's lease and poll-timing hints.
 func (c *Client) PollTasks(ctx context.Context, handlerName, workerID string, limit int) ([]WorkerTask, error) {
+	batch, err := c.PollTaskBatch(ctx, handlerName, workerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return batch.Tasks, nil
+}
+
+// PollTaskBatch claims tasks for a handler and returns the full poll response,
+// including lease_secs, heartbeat_interval_secs, and poll_after_ms hints.
+func (c *Client) PollTaskBatch(ctx context.Context, handlerName, workerID string, limit int) (*PollBatch, error) {
 	body := map[string]any{
 		"handler_name": handlerName,
 		"worker_id":    workerID,
 		"limit":        limit,
 	}
-	var out []WorkerTask
-	if err := c.do(ctx, http.MethodPost, "/workers/tasks/poll", body, &out); err != nil {
+	var raw json.RawMessage
+	if err := c.do(ctx, http.MethodPost, "/workers/tasks/poll", body, &raw); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return DecodePollBatch(raw)
+}
+
+// DecodePollBatch normalizes a worker poll response. Current engines return
+// {"tasks": [...], "lease_secs": ..., ...}; legacy engines returned a bare
+// array, which is accepted without timing hints.
+func DecodePollBatch(raw json.RawMessage) (*PollBatch, error) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return &PollBatch{Tasks: []WorkerTask{}}, nil
+	}
+	if trimmed[0] == '[' {
+		var tasks []WorkerTask
+		if err := json.Unmarshal(trimmed, &tasks); err != nil {
+			return nil, fmt.Errorf("decode worker poll response: %w", err)
+		}
+		return &PollBatch{Tasks: tasks}, nil
+	}
+	var batch PollBatch
+	if err := json.Unmarshal(trimmed, &batch); err != nil {
+		return nil, fmt.Errorf("decode worker poll response: %w", err)
+	}
+	if batch.Tasks == nil {
+		return nil, fmt.Errorf("worker poll response must contain a tasks array")
+	}
+	return &batch, nil
 }
 
 // CompleteTask marks a worker task as completed.
+//
+// Deprecated: current engines require the claim epoch returned by poll; this
+// sends claim_epoch 0. Use CompleteTaskLease.
 func (c *Client) CompleteTask(ctx context.Context, taskID string, workerID string, output any) error {
+	return c.CompleteTaskLease(ctx, taskID, TaskLease{WorkerID: workerID}, output)
+}
+
+// CompleteTaskLease completes a claimed task, echoing the lease (worker_id +
+// claim_epoch) the engine issued at claim time. A 409 means the lease changed
+// (the task was reclaimed); do not retry it as a different outcome.
+func (c *Client) CompleteTaskLease(ctx context.Context, taskID string, lease TaskLease, output any) error {
+	if output == nil {
+		output = map[string]any{}
+	}
 	body := map[string]any{
-		"worker_id": workerID,
-		"output":    output,
+		"worker_id":   lease.WorkerID,
+		"claim_epoch": lease.ClaimEpoch,
+		"output":      output,
 	}
 	return c.do(ctx, http.MethodPost, "/workers/tasks/"+pathSegment(taskID)+"/complete", body, nil)
 }
 
 // FailTask marks a worker task as failed.
+//
+// Deprecated: current engines require the claim epoch returned by poll; this
+// sends claim_epoch 0. Use FailTaskLease.
 func (c *Client) FailTask(ctx context.Context, taskID, workerID, message string, retryable bool) error {
+	return c.FailTaskLease(ctx, taskID, TaskLease{WorkerID: workerID}, message, retryable)
+}
+
+// FailTaskLease fails a claimed task under its lease.
+func (c *Client) FailTaskLease(ctx context.Context, taskID string, lease TaskLease, message string, retryable bool) error {
 	body := map[string]any{
-		"worker_id": workerID,
-		"message":   message,
-		"retryable": retryable,
+		"worker_id":   lease.WorkerID,
+		"claim_epoch": lease.ClaimEpoch,
+		"message":     message,
+		"retryable":   retryable,
 	}
 	return c.do(ctx, http.MethodPost, "/workers/tasks/"+pathSegment(taskID)+"/fail", body, nil)
 }
 
 // HeartbeatTask sends a heartbeat for an in-flight worker task.
+//
+// Deprecated: use HeartbeatTaskLease, which echoes the claim epoch.
 func (c *Client) HeartbeatTask(ctx context.Context, taskID, workerID string) error {
-	_, err := c.HeartbeatTaskWithCheckpoint(ctx, taskID, workerID, nil, nil)
+	_, err := c.HeartbeatTaskLease(ctx, taskID, TaskLease{WorkerID: workerID}, nil, nil)
 	return err
 }
 
 // HeartbeatTaskWithCheckpoint heartbeats a task and optionally advances its
 // resumable checkpoint using optimistic checkpoint sequencing.
+//
+// Deprecated: use HeartbeatTaskLease, which echoes the claim epoch.
 func (c *Client) HeartbeatTaskWithCheckpoint(ctx context.Context, taskID, workerID string, checkpoint any, checkpointSeq *uint64) (*HeartbeatResponse, error) {
+	return c.HeartbeatTaskLease(ctx, taskID, TaskLease{WorkerID: workerID}, checkpoint, checkpointSeq)
+}
+
+// HeartbeatTaskLease extends a task lease and optionally advances its
+// resumable checkpoint (checkpointSeq is required with checkpoint).
+func (c *Client) HeartbeatTaskLease(ctx context.Context, taskID string, lease TaskLease, checkpoint any, checkpointSeq *uint64) (*HeartbeatResponse, error) {
 	body := map[string]any{
-		"worker_id": workerID,
+		"worker_id":   lease.WorkerID,
+		"claim_epoch": lease.ClaimEpoch,
 	}
 	if checkpoint != nil {
 		if checkpointSeq == nil {
@@ -942,17 +1012,27 @@ func (c *Client) GetWorkerTaskStats(ctx context.Context) (map[string]any, error)
 
 // PollTasksFromQueue polls for available worker tasks from a specific queue.
 func (c *Client) PollTasksFromQueue(ctx context.Context, queue, handlerName, workerID string, limit int) ([]WorkerTask, error) {
+	batch, err := c.PollTaskBatchFromQueue(ctx, queue, handlerName, workerID, limit)
+	if err != nil {
+		return nil, err
+	}
+	return batch.Tasks, nil
+}
+
+// PollTaskBatchFromQueue claims tasks from a named queue and returns the full
+// poll response including lease hints.
+func (c *Client) PollTaskBatchFromQueue(ctx context.Context, queue, handlerName, workerID string, limit int) (*PollBatch, error) {
 	body := map[string]any{
 		"queue_name":   queue,
 		"handler_name": handlerName,
 		"worker_id":    workerID,
 		"limit":        limit,
 	}
-	var out []WorkerTask
-	if err := c.do(ctx, http.MethodPost, "/workers/tasks/poll/queue", body, &out); err != nil {
+	var raw json.RawMessage
+	if err := c.do(ctx, http.MethodPost, "/workers/tasks/poll/queue", body, &raw); err != nil {
 		return nil, err
 	}
-	return out, nil
+	return DecodePollBatch(raw)
 }
 
 // ---------------------------------------------------------------------------
